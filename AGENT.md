@@ -5,17 +5,26 @@
 ---
 
 ## Project Purpose
-[Fill in: What this project does - 1-2 sentences]
+GroveMusic is a music curation and playlist generation service that creates personalized playlists based on seed tracks using music metadata APIs, vector similarity matching, and LLM-powered explanations. Part of the Grove ecosystem, hosted at music.grove.place.
 
 ## Tech Stack
-[Fill in: Technologies, frameworks, and languages used]
-- Language:
-- Framework:
-- Key Libraries:
-- Package Manager:
+- **Language:** TypeScript
+- **Framework:** SvelteKit (frontend) + Cloudflare Workers (backend)
+- **Key Libraries:** @sveltejs/adapter-cloudflare, hono (API routing)
+- **Package Manager:** pnpm
+- **Database:** Cloudflare D1 (SQLite)
+- **Caching:** Cloudflare KV
+- **Storage:** Cloudflare R2 (archives), Vectorize (track embeddings)
+- **Auth:** Google OAuth 2.0
+- **External APIs:** Last.fm, MusicBrainz, Claude/Anthropic
 
 ## Architecture Notes
-[Fill in: Key architectural decisions, patterns, or structure]
+- **Durable Objects** for stateful pipeline execution (MusicPipelineDO, RateLimiterDO)
+- **Multi-stage pipeline:** resolve → enrich → generate → score → curate → explain
+- **Credit system:** Usage-based with subscription tiers (Free/Basic/Pro)
+- **Caching strategy:** 4-layer (DO memory → KV → D1 → R2)
+- **Rate limiting:** Per-user (subscription tier) + per-external-API (protect from bans)
+- See `grovemusic-spec.md` for complete specification
 
 ---
 

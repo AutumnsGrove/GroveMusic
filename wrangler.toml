@@ -1,0 +1,107 @@
+# GroveMusic - Cloudflare Workers Configuration
+# See: https://developers.cloudflare.com/workers/wrangler/configuration/
+
+name = "grovemusic"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"]
+main = ".svelte-kit/cloudflare/_worker.js"
+pages_build_output_dir = ".svelte-kit/cloudflare"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# D1 Database
+# Create with: wrangler d1 create grovemusic-db
+# ─────────────────────────────────────────────────────────────────────────────
+[[d1_databases]]
+binding = "DB"
+database_name = "grovemusic-db"
+database_id = ""  # Fill after creating: wrangler d1 create grovemusic-db
+
+# ─────────────────────────────────────────────────────────────────────────────
+# KV Namespaces
+# Create with: wrangler kv namespace create <NAME>
+# ─────────────────────────────────────────────────────────────────────────────
+
+# API response caching (Last.fm, MusicBrainz)
+[[kv_namespaces]]
+binding = "CACHE"
+id = ""  # Fill after creating
+
+# User sessions
+[[kv_namespaces]]
+binding = "SESSIONS"
+id = ""  # Fill after creating
+
+# Rate limiting counters
+[[kv_namespaces]]
+binding = "RATE_LIMITS"
+id = ""  # Fill after creating
+
+# Runtime configuration, prompt templates
+[[kv_namespaces]]
+binding = "CONFIG"
+id = ""  # Fill after creating
+
+# ─────────────────────────────────────────────────────────────────────────────
+# R2 Object Storage
+# Create with: wrangler r2 bucket create grovemusic-storage
+# ─────────────────────────────────────────────────────────────────────────────
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "grovemusic-storage"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Vectorize Index (Track Embeddings)
+# Create with: wrangler vectorize create grovemusic-tracks --dimensions=1536 --metric=cosine
+# ─────────────────────────────────────────────────────────────────────────────
+[[vectorize]]
+binding = "TRACKS"
+index_name = "grovemusic-tracks"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Durable Objects
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Pipeline execution and state management
+[[durable_objects.bindings]]
+name = "MUSIC_PIPELINE"
+class_name = "MusicPipelineDO"
+
+# Per-API rate limiting (Last.fm, MusicBrainz)
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+# Durable Object migrations
+[[migrations]]
+tag = "v1"
+new_classes = ["MusicPipelineDO", "RateLimiterDO"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment Variables (Non-secret)
+# ─────────────────────────────────────────────────────────────────────────────
+[vars]
+APP_URL = "https://music.grove.place"
+ENVIRONMENT = "development"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Secrets (set via: wrangler secret put <NAME>)
+# ─────────────────────────────────────────────────────────────────────────────
+# GOOGLE_CLIENT_ID
+# GOOGLE_CLIENT_SECRET
+# GOOGLE_REDIRECT_URI
+# LASTFM_API_KEY
+# LASTFM_SHARED_SECRET
+# ANTHROPIC_API_KEY
+# SESSION_SECRET
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Development Overrides
+# ─────────────────────────────────────────────────────────────────────────────
+[env.development]
+vars = { APP_URL = "http://localhost:5173", ENVIRONMENT = "development" }
+
+[env.preview]
+vars = { ENVIRONMENT = "preview" }
+
+[env.production]
+vars = { APP_URL = "https://music.grove.place", ENVIRONMENT = "production" }

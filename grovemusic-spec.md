@@ -1,9 +1,10 @@
 # GroveMusic - Project Specification
 
 **Version:** 1.0.0  
-**Last Updated:** December 2024  
+**Last Updated:** December 2025
 **Domain:** music.grove.place  
 **Status:** Planning Phase
+**Author:** Autumn Brown, Claude, Grove.place team
 
 ---
 

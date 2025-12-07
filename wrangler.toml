@@ -1,10 +1,9 @@
-# GroveMusic - Cloudflare Workers Configuration
-# See: https://developers.cloudflare.com/workers/wrangler/configuration/
+# GroveMusic Frontend - Cloudflare Pages Configuration
+# Pipeline Worker with DOs will be in /workers/pipeline/
 
 name = "grovemusic"
 compatibility_date = "2025-12-01"
 compatibility_flags = ["nodejs_compat"]
-main = ".svelte-kit/cloudflare/_worker.js"
 pages_build_output_dir = ".svelte-kit/cloudflare"
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -19,22 +18,18 @@ database_id = "e1e31ed2-3b1f-4dbd-9435-c9105dadcfa2"
 # KV Namespaces
 # ─────────────────────────────────────────────────────────────────────────────
 
-# API response caching (Last.fm, MusicBrainz)
 [[kv_namespaces]]
 binding = "CACHE"
 id = "677a09cfeb5c4afe9bac24240c1fcc6d"
 
-# User sessions
 [[kv_namespaces]]
 binding = "SESSIONS"
 id = "46c5fb1dd2d04385a7e624b2e4730ad6"
 
-# Rate limiting counters
 [[kv_namespaces]]
 binding = "RATE_LIMITS"
 id = "d5c976093f344aba948f77f37d29194a"
 
-# Runtime configuration, prompt templates
 [[kv_namespaces]]
 binding = "CONFIG"
 id = "6488be12cf90402caf6ced7bf156ad6c"
@@ -47,54 +42,25 @@ binding = "STORAGE"
 bucket_name = "grovemusic-storage"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Vectorize Index (Track Embeddings)
+# Vectorize Index
 # ─────────────────────────────────────────────────────────────────────────────
 [[vectorize]]
 binding = "TRACKS"
 index_name = "grovemusic-tracks"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Durable Objects
+# Service Binding to Pipeline Worker (add after pipeline worker is deployed)
 # ─────────────────────────────────────────────────────────────────────────────
-
-# Pipeline execution and state management
-[[durable_objects.bindings]]
-name = "MUSIC_PIPELINE"
-class_name = "MusicPipelineDO"
-
-# Per-API rate limiting (Last.fm, MusicBrainz)
-[[durable_objects.bindings]]
-name = "RATE_LIMITER"
-class_name = "RateLimiterDO"
-
-# Durable Object migrations
-[[migrations]]
-tag = "v1"
-new_classes = ["MusicPipelineDO", "RateLimiterDO"]
+# [[services]]
+# binding = "PIPELINE"
+# service = "grovemusic-pipeline"
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Environment Variables (Non-secret)
+# Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
 [vars]
 APP_URL = "https://music.grove.place"
-ENVIRONMENT = "development"
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Secrets (set via: wrangler secret put <NAME>)
-# ─────────────────────────────────────────────────────────────────────────────
-# GOOGLE_CLIENT_ID
-# GOOGLE_CLIENT_SECRET
-# GOOGLE_REDIRECT_URI
-# LASTFM_API_KEY
-# LASTFM_SHARED_SECRET
-# ANTHROPIC_API_KEY
-# SESSION_SECRET
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Development Overrides
-# ─────────────────────────────────────────────────────────────────────────────
-[env.development]
-vars = { APP_URL = "http://localhost:5173", ENVIRONMENT = "development" }
+ENVIRONMENT = "production"
 
 [env.preview]
 vars = { ENVIRONMENT = "preview" }

@@ -1,0 +1,54 @@
+# GroveMusic Pipeline Worker - Durable Objects
+# This worker handles the playlist generation pipeline
+
+name = "grovemusic-pipeline"
+compatibility_date = "2025-12-01"
+compatibility_flags = ["nodejs_compat"]
+main = "src/index.ts"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Durable Objects
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[durable_objects.bindings]]
+name = "MUSIC_PIPELINE"
+class_name = "MusicPipelineDO"
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiterDO"
+
+[[migrations]]
+tag = "v1"
+new_classes = ["MusicPipelineDO", "RateLimiterDO"]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Shared Resources (same as frontend)
+# ─────────────────────────────────────────────────────────────────────────────
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grovemusic-db"
+database_id = "e1e31ed2-3b1f-4dbd-9435-c9105dadcfa2"
+
+[[kv_namespaces]]
+binding = "CACHE"
+id = "677a09cfeb5c4afe9bac24240c1fcc6d"
+
+[[kv_namespaces]]
+binding = "CONFIG"
+id = "6488be12cf90402caf6ced7bf156ad6c"
+
+[[r2_buckets]]
+binding = "STORAGE"
+bucket_name = "grovemusic-storage"
+
+[[vectorize]]
+binding = "TRACKS"
+index_name = "grovemusic-tracks"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Environment Variables
+# ─────────────────────────────────────────────────────────────────────────────
+[vars]
+ENVIRONMENT = "production"

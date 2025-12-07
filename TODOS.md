@@ -3,11 +3,11 @@
 ## Phase 0: Foundation (Current)
 - [x] Set up Cloudflare project structure (wrangler.toml)
 - [x] Configure D1 database with schema
-- [x] Set up KV namespaces
-- [ ] Create Vectorize index
-- [ ] Set up R2 bucket
+- [x] Set up KV namespaces (CACHE, SESSIONS, RATE_LIMITS, CONFIG)
+- [x] Create Vectorize index (grovemusic-tracks)
+- [x] Set up R2 bucket (grovemusic-storage)
 - [ ] Implement Google OAuth
-- [ ] Basic SvelteKit shell with GroveEngine patterns
+- [x] Basic SvelteKit shell with landing page
 
 ## Phase 1: Core Pipeline
 - [ ] Track Resolver Worker (MusicBrainz + Last.fm)
@@ -46,13 +46,13 @@
 ---
 
 ## Immediate Next Steps
-1. Run `pnpm install` to install dependencies
-2. Set up Cloudflare account and get API credentials
-3. Create D1 database: `wrangler d1 create grovemusic-db`
-4. Create KV namespaces: `wrangler kv namespace create CACHE`
-5. Get Last.fm API key from https://www.last.fm/api/account/create
-6. Set up Google OAuth credentials in Google Cloud Console
-7. Copy `secrets_template.json` to `secrets.json` and fill in values
+1. ~~Run `pnpm install` to install dependencies~~ ✅
+2. ~~Set up Cloudflare resources (D1, KV, R2, Vectorize)~~ ✅
+3. Get Last.fm API key from https://www.last.fm/api/account/create
+4. Set up Google OAuth credentials in Google Cloud Console
+5. Get Anthropic API key from https://console.anthropic.com
+6. Copy `secrets_template.json` to `secrets.json` and fill in values
+7. Run `pnpm dev` to start local development
 
 ---
 

@@ -9,41 +9,38 @@ pages_build_output_dir = ".svelte-kit/cloudflare"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # D1 Database
-# Create with: wrangler d1 create grovemusic-db
 # ─────────────────────────────────────────────────────────────────────────────
 [[d1_databases]]
 binding = "DB"
 database_name = "grovemusic-db"
-database_id = ""  # Fill after creating: wrangler d1 create grovemusic-db
+database_id = "e1e31ed2-3b1f-4dbd-9435-c9105dadcfa2"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # KV Namespaces
-# Create with: wrangler kv namespace create <NAME>
 # ─────────────────────────────────────────────────────────────────────────────
 
 # API response caching (Last.fm, MusicBrainz)
 [[kv_namespaces]]
 binding = "CACHE"
-id = ""  # Fill after creating
+id = "677a09cfeb5c4afe9bac24240c1fcc6d"
 
 # User sessions
 [[kv_namespaces]]
 binding = "SESSIONS"
-id = ""  # Fill after creating
+id = "46c5fb1dd2d04385a7e624b2e4730ad6"
 
 # Rate limiting counters
 [[kv_namespaces]]
 binding = "RATE_LIMITS"
-id = ""  # Fill after creating
+id = "d5c976093f344aba948f77f37d29194a"
 
 # Runtime configuration, prompt templates
 [[kv_namespaces]]
 binding = "CONFIG"
-id = ""  # Fill after creating
+id = "6488be12cf90402caf6ced7bf156ad6c"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # R2 Object Storage
-# Create with: wrangler r2 bucket create grovemusic-storage
 # ─────────────────────────────────────────────────────────────────────────────
 [[r2_buckets]]
 binding = "STORAGE"
@@ -51,7 +48,6 @@ bucket_name = "grovemusic-storage"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Vectorize Index (Track Embeddings)
-# Create with: wrangler vectorize create grovemusic-tracks --dimensions=1536 --metric=cosine
 # ─────────────────────────────────────────────────────────────────────────────
 [[vectorize]]
 binding = "TRACKS"

@@ -4,8 +4,10 @@
 
 A service that creates personalized playlists based on seed tracks, using music metadata APIs, vector similarity matching, and LLM-powered explanations.
 
-**Domain:** music.grove.place
-**Status:** Development
+**Domain:** [music.grove.place](https://music.grove.place)
+**Status:** Under Active Development
+
+> **Follow development progress:** [autumnsgrove.com/blog](https://autumnsgrove.com/blog)
 
 ---
 

@@ -5,7 +5,7 @@
 
 <main>
 	<header>
-		<h1>GroveMusic</h1>
+		<h1>Aria</h1>
 		<p>AI-powered playlist generation based on seed tracks</p>
 	</header>
 

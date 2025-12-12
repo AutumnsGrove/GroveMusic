@@ -5,7 +5,7 @@
 </script>
 
 <svelte:head>
-	<title>GroveMusic</title>
+	<title>Aria</title>
 </svelte:head>
 
 {@render children()}

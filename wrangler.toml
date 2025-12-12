@@ -59,11 +59,11 @@ index_name = "grovemusic-tracks"
 # Environment Variables
 # ─────────────────────────────────────────────────────────────────────────────
 [vars]
-APP_URL = "https://music.grove.place"
+APP_URL = "https://aria.grove.place"
 ENVIRONMENT = "production"
 
 [env.preview]
 vars = { ENVIRONMENT = "preview" }
 
 [env.production]
-vars = { APP_URL = "https://music.grove.place", ENVIRONMENT = "production" }
+vars = { APP_URL = "https://aria.grove.place", ENVIRONMENT = "production" }

@@ -5,7 +5,11 @@
 ---
 
 ## Project Purpose
-GroveMusic is a music curation and playlist generation service that creates personalized playlists based on seed tracks using music metadata APIs, vector similarity matching, and LLM-powered explanations. Part of the Grove ecosystem, hosted at music.grove.place.
+Aria (internal codename: GroveMusic) is a music curation and playlist generation service that creates personalized playlists based on seed tracks using music metadata APIs, vector similarity matching, and LLM-powered explanations. Part of the Grove ecosystem, hosted at aria.grove.place.
+
+### Naming Convention
+- **Public name:** Aria — used in UI, marketing, user-facing text
+- **Internal codename:** GroveMusic — used in code, infrastructure, database names, worker names, and deployments
 
 ## Tech Stack
 - **Language:** TypeScript

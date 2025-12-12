@@ -1,11 +1,13 @@
-# GroveMusic
+# Aria
 
 **Music curation and playlist generation powered by AI**
 
-A service that creates personalized playlists based on seed tracks, using music metadata APIs, vector similarity matching, and LLM-powered explanations.
+A service that creates personalized playlists based on seed tracks, using music metadata APIs, vector similarity matching, and LLM-powered explanations. An aria is a self-contained melody — and that's exactly what we create for you.
 
-**Domain:** [music.grove.place](https://music.grove.place)
+**Domain:** [aria.grove.place](https://aria.grove.place)
 **Status:** Under Active Development
+
+> **Internal codename:** GroveMusic — used in code, infrastructure, and deployments
 
 > **Follow development progress:** [autumnsgrove.com/blog](https://autumnsgrove.com/blog)
 

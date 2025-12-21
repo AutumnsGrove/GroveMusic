@@ -1,0 +1,1082 @@
+# Spotify Metadata Integration Specification
+
+**Version:** 1.0.0
+**Last Updated:** December 2025
+**Status:** Research/Planning
+**Parent Spec:** grovemusic-spec.md
+**Data Source:** Anna's Archive Spotify Backup (December 2025)
+
+---
+
+## Executive Summary
+
+This specification details how Aria can leverage the Anna's Archive Spotify metadata dump to dramatically improve track similarity matching, expand catalog coverage, and enable collaborative filtering. The integration focuses exclusively on **metadata** (not audio files), providing 256 million tracks with pre-computed audio features and 1.7 billion playlist co-occurrence relationships.
+
+### Key Benefits
+
+| Benefit | Current State | With Spotify Metadata |
+|---------|---------------|----------------------|
+| **Catalog coverage** | ~5M tracks (MusicBrainz ISRCs) | 186M unique ISRCs |
+| **Audio features** | None (tag-based only) | Tempo, energy, danceability, etc. |
+| **Similarity signals** | Last.fm similar tracks API | + Playlist co-occurrence graph |
+| **API dependencies** | External rate limits | Self-hosted, unlimited |
+| **Vector embeddings** | Text-based (tags, descriptions) | Numerical audio features |
+
+---
+
+## Table of Contents
+
+1. [Data Source Overview](#data-source-overview)
+2. [Dataset Inventory](#dataset-inventory)
+3. [Storage Architecture](#storage-architecture)
+4. [Schema Design](#schema-design)
+5. [Cross-Reference Strategy](#cross-reference-strategy)
+6. [Pipeline Integration](#pipeline-integration)
+7. [Audio Features Deep Dive](#audio-features-deep-dive)
+8. [Playlist Co-occurrence Mining](#playlist-co-occurrence-mining)
+9. [Import Pipeline](#import-pipeline)
+10. [Operational Considerations](#operational-considerations)
+11. [Legal & Ethical Notes](#legal--ethical-notes)
+12. [Implementation Phases](#implementation-phases)
+
+---
+
+## Data Source Overview
+
+### Origin
+
+Anna's Archive released a comprehensive Spotify backup on December 20, 2025, distributed via torrents. The backup includes:
+
+- **Audio files:** ~300TB of OGG Vorbis/Opus files (NOT needed for Aria)
+- **Metadata databases:** ~200GB compressed SQLite files (PRIMARY interest)
+- **Audio analysis:** ~4TB compressed of detailed audio features (SECONDARY interest)
+- **Playlist data:** Millions of playlists with billions of track references (HIGH value)
+
+### Data Freshness
+
+- **Cutoff date:** July 2025
+- **Coverage:** ~99.6% of Spotify listening activity
+- **Limitations:** Tracks released after July 2025 not included
+
+### Access Method
+
+Data is distributed exclusively via BitTorrent through Anna's Archive torrents page. Metadata torrents are separate from audio file torrents.
+
+---
+
+## Dataset Inventory
+
+### Primary Databases (Required)
+
+| Database | Description | Compressed Size | Priority |
+|----------|-------------|-----------------|----------|
+| `spotify_tracks.db` | Track metadata (title, artist, album, ISRC, popularity) | ~50GB | **Critical** |
+| `spotify_artists.db` | Artist metadata (name, genres, followers, popularity) | ~5GB | **Critical** |
+| `spotify_albums.db` | Album metadata (name, label, release date, UPC) | ~15GB | **Critical** |
+| `spotify_audio_features.db` | Audio analysis (tempo, key, energy, etc.) | ~4TB | **High** |
+| `spotify_playlists.db` | Playlist metadata and track lists | ~100GB | **High** |
+
+### Secondary Data (Optional)
+
+| Data | Description | Size | Priority |
+|------|-------------|------|----------|
+| Album artwork references | URLs/hashes for cover art | ~10GB | Low |
+| Podcast/audiobook metadata | Non-music content | ~20GB | Not needed |
+| Raw JSON archives | Original API responses | ~50GB | Not needed |
+
+---
+
+## Storage Architecture
+
+### Tiered Storage Strategy
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    SPOTIFY METADATA STORAGE TIERS                        │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Tier 1: Hot Data (Cloudflare D1)                                       │
+│  ─────────────────────────────────                                      │
+│  • Cross-reference tables (ISRC → MBID mappings)                        │
+│  • Frequently accessed track metadata                                    │
+│  • Playlist co-occurrence scores (precomputed)                          │
+│  • Size limit: ~10GB per D1 database                                    │
+│                                                                          │
+│  Tier 2: Warm Data (Cloudflare R2 + SQLite)                             │
+│  ──────────────────────────────────────────                             │
+│  • Full track/artist/album databases                                     │
+│  • Audio features database                                               │
+│  • Queryable via sql.js or better-sqlite3 in Workers                   │
+│  • Size: ~200GB uncompressed                                            │
+│                                                                          │
+│  Tier 3: Vector Index (Cloudflare Vectorize)                            │
+│  ───────────────────────────────────────────                            │
+│  • Audio feature embeddings (normalized)                                 │
+│  • Hybrid embeddings (audio + text features)                            │
+│  • Size: ~256M vectors × dimensions                                     │
+│                                                                          │
+│  Tier 4: Cold Storage (Cloudflare R2 Archive)                           │
+│  ────────────────────────────────────────────                           │
+│  • Original SQLite database files                                        │
+│  • Playlist raw data                                                     │
+│  • Backup/recovery                                                       │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cloudflare Resource Estimates
+
+| Resource | Usage | Monthly Cost Estimate |
+|----------|-------|----------------------|
+| D1 Storage | 10GB | ~$0.75 |
+| D1 Reads | 10M/month | ~$0.50 |
+| R2 Storage | 250GB | ~$3.75 |
+| R2 Operations | 5M/month | ~$2.00 |
+| Vectorize | 256M vectors | TBD (beta pricing) |
+| **Total** | | ~$10-20/month |
+
+---
+
+## Schema Design
+
+### D1 Schema: Cross-Reference Tables
+
+```sql
+-- Primary cross-reference: Spotify ↔ MusicBrainz
+CREATE TABLE spotify_mbid_xref (
+  spotify_id TEXT PRIMARY KEY,      -- Spotify base62 track ID
+  isrc TEXT NOT NULL,               -- International Standard Recording Code
+  mbid TEXT,                        -- MusicBrainz Recording ID (nullable if no match)
+  match_confidence REAL,            -- 0.0-1.0 confidence score
+  match_method TEXT,                -- 'isrc_exact', 'isrc_fuzzy', 'metadata_match'
+  created_at INTEGER DEFAULT (unixepoch()),
+  updated_at INTEGER DEFAULT (unixepoch())
+);
+
+CREATE INDEX idx_xref_isrc ON spotify_mbid_xref(isrc);
+CREATE INDEX idx_xref_mbid ON spotify_mbid_xref(mbid);
+
+-- Cached audio features for hot tracks
+CREATE TABLE spotify_audio_features_cache (
+  spotify_id TEXT PRIMARY KEY,
+  tempo REAL,                       -- BPM
+  time_signature INTEGER,           -- Beats per bar
+  key INTEGER,                      -- Pitch class (0-11)
+  mode INTEGER,                     -- Major (1) or Minor (0)
+  loudness REAL,                    -- dB
+  energy REAL,                      -- 0.0-1.0
+  danceability REAL,                -- 0.0-1.0
+  speechiness REAL,                 -- 0.0-1.0
+  acousticness REAL,                -- 0.0-1.0
+  instrumentalness REAL,            -- 0.0-1.0
+  liveness REAL,                    -- 0.0-1.0
+  valence REAL,                     -- 0.0-1.0 (musical positivity)
+  duration_ms INTEGER,
+  popularity INTEGER,               -- 0-100 at time of snapshot
+  cached_at INTEGER DEFAULT (unixepoch())
+);
+
+-- Precomputed playlist co-occurrence scores
+CREATE TABLE playlist_cooccurrence (
+  track_a TEXT NOT NULL,            -- Spotify ID (lower alphabetically)
+  track_b TEXT NOT NULL,            -- Spotify ID (higher alphabetically)
+  cooccurrence_count INTEGER,       -- Number of playlists containing both
+  pmi_score REAL,                   -- Pointwise Mutual Information
+  jaccard_score REAL,               -- Jaccard similarity
+  PRIMARY KEY (track_a, track_b)
+);
+
+CREATE INDEX idx_cooccur_a ON playlist_cooccurrence(track_a);
+CREATE INDEX idx_cooccur_b ON playlist_cooccurrence(track_b);
+
+-- Artist genre mappings
+CREATE TABLE spotify_artist_genres (
+  spotify_artist_id TEXT NOT NULL,
+  genre TEXT NOT NULL,
+  PRIMARY KEY (spotify_artist_id, genre)
+);
+
+CREATE INDEX idx_genre ON spotify_artist_genres(genre);
+```
+
+### R2 SQLite Schema (Imported from Source)
+
+The source databases use schemas closely matching Spotify's API responses:
+
+```sql
+-- Tracks table (spotify_tracks.db)
+CREATE TABLE tracks (
+  id TEXT PRIMARY KEY,              -- Spotify base62 ID
+  name TEXT NOT NULL,
+  artist_ids TEXT,                  -- JSON array of artist IDs
+  album_id TEXT,
+  disc_number INTEGER,
+  track_number INTEGER,
+  duration_ms INTEGER,
+  explicit INTEGER,                 -- Boolean
+  isrc TEXT,
+  popularity INTEGER,               -- 0-100
+  preview_url TEXT,
+  external_urls TEXT                -- JSON
+);
+
+-- Artists table (spotify_artists.db)
+CREATE TABLE artists (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  genres TEXT,                      -- JSON array
+  followers INTEGER,
+  popularity INTEGER,
+  external_urls TEXT
+);
+
+-- Albums table (spotify_albums.db)
+CREATE TABLE albums (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  artist_ids TEXT,                  -- JSON array
+  release_date TEXT,                -- YYYY or YYYY-MM-DD
+  release_date_precision TEXT,      -- 'year', 'month', 'day'
+  total_tracks INTEGER,
+  album_type TEXT,                  -- 'album', 'single', 'compilation'
+  label TEXT,
+  upc TEXT,
+  external_urls TEXT
+);
+
+-- Audio Features table (spotify_audio_features.db)
+CREATE TABLE audio_features (
+  id TEXT PRIMARY KEY,              -- Same as track ID
+  danceability REAL,
+  energy REAL,
+  key INTEGER,
+  loudness REAL,
+  mode INTEGER,
+  speechiness REAL,
+  acousticness REAL,
+  instrumentalness REAL,
+  liveness REAL,
+  valence REAL,
+  tempo REAL,
+  duration_ms INTEGER,
+  time_signature INTEGER
+);
+
+-- Playlists table (spotify_playlists.db)
+CREATE TABLE playlists (
+  id TEXT PRIMARY KEY,
+  name TEXT,
+  description TEXT,
+  owner_id TEXT,
+  followers INTEGER,
+  public INTEGER,
+  collaborative INTEGER
+);
+
+CREATE TABLE playlist_tracks (
+  playlist_id TEXT NOT NULL,
+  track_id TEXT NOT NULL,
+  position INTEGER,
+  added_at TEXT,
+  PRIMARY KEY (playlist_id, track_id)
+);
+```
+
+### Vectorize Schema
+
+```typescript
+interface SpotifyAudioVector {
+  id: string;                       // Spotify track ID
+  values: number[];                 // Normalized audio features
+  metadata: {
+    isrc: string;
+    mbid?: string;                  // If cross-referenced
+    title: string;
+    artist: string;
+    popularity: number;
+    genres: string[];               // From artist
+    year?: number;
+  };
+}
+```
+
+**Vector Dimensions (13 features, normalized):**
+
+| Index | Feature | Normalization |
+|-------|---------|---------------|
+| 0 | tempo | (tempo - 60) / 140, clamped 0-1 |
+| 1 | energy | Already 0-1 |
+| 2 | danceability | Already 0-1 |
+| 3 | valence | Already 0-1 |
+| 4 | acousticness | Already 0-1 |
+| 5 | instrumentalness | Already 0-1 |
+| 6 | speechiness | Already 0-1 |
+| 7 | liveness | Already 0-1 |
+| 8 | loudness | (loudness + 60) / 60, clamped 0-1 |
+| 9 | key | key / 11 |
+| 10 | mode | 0 or 1 |
+| 11 | time_signature | (time_sig - 3) / 4, clamped 0-1 |
+| 12 | popularity | popularity / 100 |
+
+**Alternative: Hybrid Vectors (1536 dimensions)**
+
+Combine audio features with text embeddings:
+- Dimensions 0-12: Audio features (above)
+- Dimensions 13-1535: Text embedding of "{artist} - {title} [{genres}]"
+
+---
+
+## Cross-Reference Strategy
+
+### ISRC as the Bridge
+
+ISRC (International Standard Recording Code) is the universal identifier for recordings:
+
+```
+┌──────────────┐     ┌──────────────┐     ┌──────────────┐
+│   Spotify    │     │     ISRC     │     │ MusicBrainz  │
+│   Track ID   │────▶│   Bridge     │◀────│     MBID     │
+│  (base62)    │     │              │     │   (UUID)     │
+└──────────────┘     └──────────────┘     └──────────────┘
+     256M                 186M                  5M
+```
+
+### Matching Pipeline
+
+```typescript
+interface CrossRefResult {
+  spotifyId: string;
+  isrc: string;
+  mbid: string | null;
+  confidence: number;
+  method: 'isrc_exact' | 'isrc_fuzzy' | 'metadata_match' | 'no_match';
+}
+
+async function crossReference(spotifyTrack: SpotifyTrack): Promise<CrossRefResult> {
+  // Step 1: Exact ISRC match in MusicBrainz
+  const mbRecording = await musicbrainz.lookupByISRC(spotifyTrack.isrc);
+  if (mbRecording) {
+    return {
+      spotifyId: spotifyTrack.id,
+      isrc: spotifyTrack.isrc,
+      mbid: mbRecording.id,
+      confidence: 1.0,
+      method: 'isrc_exact'
+    };
+  }
+
+  // Step 2: Fuzzy ISRC match (handle country code variations)
+  const fuzzyMatch = await musicbrainz.fuzzyISRCLookup(spotifyTrack.isrc);
+  if (fuzzyMatch) {
+    return {
+      spotifyId: spotifyTrack.id,
+      isrc: spotifyTrack.isrc,
+      mbid: fuzzyMatch.id,
+      confidence: 0.9,
+      method: 'isrc_fuzzy'
+    };
+  }
+
+  // Step 3: Metadata matching (title + artist + duration)
+  const metadataMatch = await musicbrainz.searchRecording({
+    title: spotifyTrack.name,
+    artist: spotifyTrack.artists[0].name,
+    duration: spotifyTrack.duration_ms
+  });
+  if (metadataMatch && metadataMatch.score > 0.85) {
+    return {
+      spotifyId: spotifyTrack.id,
+      isrc: spotifyTrack.isrc,
+      mbid: metadataMatch.id,
+      confidence: metadataMatch.score,
+      method: 'metadata_match'
+    };
+  }
+
+  // No match found
+  return {
+    spotifyId: spotifyTrack.id,
+    isrc: spotifyTrack.isrc,
+    mbid: null,
+    confidence: 0,
+    method: 'no_match'
+  };
+}
+```
+
+### Expected Match Rates
+
+| Match Type | Estimated Coverage |
+|------------|-------------------|
+| ISRC exact match | ~3% (5M of 186M) |
+| Metadata match | +5-10% additional |
+| Spotify-only (no MBID) | ~85% |
+
+**Strategy:** For tracks without MBID matches, use Spotify metadata directly and treat Spotify ID as the canonical identifier.
+
+---
+
+## Pipeline Integration
+
+### Enhanced Pipeline Flow
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                   ENHANCED PIPELINE WITH SPOTIFY DATA                    │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  [1] RESOLVE              [2] ENRICH                [3] GENERATE        │
+│  ──────────────────────────────────────────────────────────────────────│
+│                                                                          │
+│  User query          ───▶ Fetch from multiple      ───▶ Multi-source    │
+│       │                   sources in parallel            candidates      │
+│       ▼                         │                            │          │
+│  ┌─────────────┐         ┌──────┴──────┐              ┌──────┴──────┐   │
+│  │ MusicBrainz │         │             │              │             │   │
+│  │   lookup    │         ▼             ▼              ▼             ▼   │
+│  └──────┬──────┘   ┌──────────┐  ┌──────────┐  ┌──────────┐ ┌────────┐ │
+│         │          │ Last.fm  │  │ Spotify  │  │ Last.fm  │ │Spotify │ │
+│         ▼          │  tags    │  │ audio    │  │ similar  │ │playlist│ │
+│  ┌─────────────┐   │          │  │ features │  │ tracks   │ │cooccur │ │
+│  │   ISRC →    │   └──────────┘  └──────────┘  └──────────┘ └────────┘ │
+│  │  Spotify    │                       │              │          │      │
+│  │   lookup    │                       │              │          │      │
+│  └──────┬──────┘                       ▼              ▼          ▼      │
+│         │                    ┌─────────────────────────────────────┐    │
+│         └───────────────────▶│         Unified Candidate Pool      │    │
+│                              └─────────────────────────────────────┘    │
+│                                                                          │
+│  [4] SCORE                  [5] CURATE               [6] OUTPUT         │
+│  ──────────────────────────────────────────────────────────────────────│
+│                                                                          │
+│  Multi-dimensional     ───▶ Balance & select    ───▶ Final playlist    │
+│  scoring                                                                 │
+│       │                                                                  │
+│       ▼                                                                  │
+│  ┌─────────────────────────────────────────────┐                        │
+│  │ Scoring Dimensions (weighted):               │                        │
+│  │  • Tag overlap (Last.fm)           15%      │                        │
+│  │  • Audio feature similarity (NEW)   25%     │                        │
+│  │  • Playlist co-occurrence (NEW)     25%     │                        │
+│  │  • Artist similarity               15%      │                        │
+│  │  • Temporal proximity              10%      │                        │
+│  │  • Popularity balance              10%      │                        │
+│  └─────────────────────────────────────────────┘                        │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### New Scoring Functions
+
+```typescript
+// Audio feature similarity using cosine distance
+function audioFeatureSimilarity(
+  seedFeatures: AudioFeatures,
+  candidateFeatures: AudioFeatures
+): number {
+  const seedVector = normalizeAudioFeatures(seedFeatures);
+  const candidateVector = normalizeAudioFeatures(candidateFeatures);
+  return cosineSimilarity(seedVector, candidateVector);
+}
+
+// Playlist co-occurrence score
+async function playlistCooccurrenceScore(
+  seedSpotifyId: string,
+  candidateSpotifyId: string
+): Promise<number> {
+  const [a, b] = [seedSpotifyId, candidateSpotifyId].sort();
+
+  const result = await db.prepare(`
+    SELECT pmi_score, jaccard_score, cooccurrence_count
+    FROM playlist_cooccurrence
+    WHERE track_a = ? AND track_b = ?
+  `).bind(a, b).first();
+
+  if (!result) return 0;
+
+  // Weighted combination of metrics
+  // PMI captures "surprisingly often together"
+  // Jaccard captures "frequently together"
+  return (
+    0.6 * normalize(result.pmi_score, -5, 10) +
+    0.4 * result.jaccard_score
+  );
+}
+
+// Combined similarity score
+interface SimilarityScores {
+  tagOverlap: number;           // 0-1 from Last.fm
+  audioFeature: number;         // 0-1 from Spotify features
+  playlistCooccurrence: number; // 0-1 from playlist mining
+  artistSimilarity: number;     // 0-1 from Last.fm/MB
+  temporalProximity: number;    // 0-1 based on release year
+  popularityFit: number;        // 0-1 based on user preference
+}
+
+function computeOverallScore(scores: SimilarityScores): number {
+  const weights = {
+    tagOverlap: 0.15,
+    audioFeature: 0.25,          // NEW - major signal
+    playlistCooccurrence: 0.25,  // NEW - major signal
+    artistSimilarity: 0.15,
+    temporalProximity: 0.10,
+    popularityFit: 0.10
+  };
+
+  return Object.entries(weights).reduce(
+    (sum, [key, weight]) => sum + scores[key as keyof SimilarityScores] * weight,
+    0
+  ) * 10; // Scale to 0-10
+}
+```
+
+---
+
+## Audio Features Deep Dive
+
+### Feature Definitions
+
+| Feature | Range | Description | Use Case |
+|---------|-------|-------------|----------|
+| **tempo** | 50-200+ BPM | Beats per minute | Energy matching |
+| **energy** | 0.0-1.0 | Intensity and activity | Mood matching |
+| **danceability** | 0.0-1.0 | Suitability for dancing | Party/chill detection |
+| **valence** | 0.0-1.0 | Musical positiveness | Mood matching |
+| **acousticness** | 0.0-1.0 | Acoustic vs electronic | Production style |
+| **instrumentalness** | 0.0-1.0 | Vocal presence | Instrumental detection |
+| **speechiness** | 0.0-1.0 | Spoken word presence | Podcast/rap detection |
+| **liveness** | 0.0-1.0 | Live audience presence | Studio vs live |
+| **loudness** | -60 to 0 dB | Overall loudness | Mastering style |
+| **key** | 0-11 | Pitch class | Harmonic matching |
+| **mode** | 0 or 1 | Major or minor | Mood matching |
+| **time_signature** | 3-7 | Beats per bar | Rhythm matching |
+
+### Feature Quality Notes
+
+From community analysis, some caveats:
+
+1. **Valence, Energy, Danceability** — These are derived from machine learning models and may not perfectly align with human perception. Treat as "rough signals" not ground truth.
+
+2. **Key Detection** — Reasonably accurate for simple songs; struggles with key changes or modal ambiguity.
+
+3. **Tempo** — Generally accurate but may report half-time or double-time for some genres.
+
+4. **Best Use** — Most effective when used as one signal among many, not as sole similarity metric.
+
+### Feature Clustering for Genre Detection
+
+```typescript
+// Genre profiles based on audio feature clustering
+const GENRE_PROFILES: Record<string, Partial<AudioFeatures>> = {
+  'edm': { energy: 0.85, danceability: 0.75, acousticness: 0.05, tempo: 128 },
+  'acoustic-folk': { energy: 0.35, acousticness: 0.85, instrumentalness: 0.3 },
+  'hip-hop': { speechiness: 0.15, danceability: 0.7, energy: 0.65 },
+  'classical': { instrumentalness: 0.9, acousticness: 0.8, speechiness: 0.02 },
+  'metal': { energy: 0.95, loudness: -5, acousticness: 0.02 },
+  'jazz': { acousticness: 0.6, instrumentalness: 0.5, liveness: 0.25 },
+};
+
+function detectGenreFromFeatures(features: AudioFeatures): string[] {
+  const scores: [string, number][] = Object.entries(GENRE_PROFILES).map(
+    ([genre, profile]) => [genre, profileSimilarity(features, profile)]
+  );
+
+  return scores
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, 3)
+    .filter(([_, score]) => score > 0.7)
+    .map(([genre]) => genre);
+}
+```
+
+---
+
+## Playlist Co-occurrence Mining
+
+### Value Proposition
+
+Playlist co-occurrence captures **human curation signals** — when millions of users put tracks together in playlists, that reveals relationships that audio features alone cannot detect:
+
+- Cover songs with originals
+- Songs from the same soundtrack
+- "Vibes" that transcend genre
+- Regional/cultural associations
+- Temporal associations (songs popular at the same time)
+
+### Mining Algorithm
+
+```typescript
+interface CooccurrenceJob {
+  // Process playlist data to build co-occurrence matrix
+  async run(): Promise<void> {
+    const BATCH_SIZE = 10000;
+    const MIN_PLAYLIST_SIZE = 5;
+    const MAX_PLAYLIST_SIZE = 500;
+    const MIN_COOCCURRENCE = 3; // Minimum times appearing together
+
+    // Track pair counts
+    const pairCounts = new Map<string, number>();
+    const trackCounts = new Map<string, number>();
+    let totalPlaylists = 0;
+
+    // Stream through all playlists
+    for await (const playlist of this.streamPlaylists()) {
+      if (playlist.tracks.length < MIN_PLAYLIST_SIZE) continue;
+      if (playlist.tracks.length > MAX_PLAYLIST_SIZE) continue;
+
+      totalPlaylists++;
+
+      // Count individual tracks
+      for (const track of playlist.tracks) {
+        trackCounts.set(track, (trackCounts.get(track) || 0) + 1);
+      }
+
+      // Count all pairs in this playlist
+      for (let i = 0; i < playlist.tracks.length; i++) {
+        for (let j = i + 1; j < playlist.tracks.length; j++) {
+          const [a, b] = [playlist.tracks[i], playlist.tracks[j]].sort();
+          const key = `${a}|${b}`;
+          pairCounts.set(key, (pairCounts.get(key) || 0) + 1);
+        }
+      }
+    }
+
+    // Compute PMI and Jaccard for significant pairs
+    for (const [key, count] of pairCounts) {
+      if (count < MIN_COOCCURRENCE) continue;
+
+      const [a, b] = key.split('|');
+      const countA = trackCounts.get(a) || 0;
+      const countB = trackCounts.get(b) || 0;
+
+      // Pointwise Mutual Information
+      // PMI = log2(P(a,b) / (P(a) * P(b)))
+      const pAB = count / totalPlaylists;
+      const pA = countA / totalPlaylists;
+      const pB = countB / totalPlaylists;
+      const pmi = Math.log2(pAB / (pA * pB));
+
+      // Jaccard similarity
+      // J(A,B) = |A ∩ B| / |A ∪ B|
+      const jaccard = count / (countA + countB - count);
+
+      await this.insertCooccurrence(a, b, count, pmi, jaccard);
+    }
+  }
+}
+```
+
+### Storage Optimization
+
+With 256M tracks, storing all pairs is infeasible. Strategies:
+
+1. **Minimum threshold:** Only store pairs appearing in 3+ playlists
+2. **Top-K per track:** Store only top 100 co-occurring tracks per track
+3. **Popularity filter:** Focus on tracks with popularity > 10
+4. **Chunked storage:** Partition by first character of track ID
+
+Estimated storage: ~10-50GB for significant pairs
+
+---
+
+## Import Pipeline
+
+### Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                         IMPORT PIPELINE                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  [1] DOWNLOAD           [2] VALIDATE           [3] TRANSFORM            │
+│  ────────────────────────────────────────────────────────────────────── │
+│  Torrent client    ───▶ Verify checksums  ───▶ Decompress              │
+│  (external)             Spot-check data        Convert schemas          │
+│                                                                          │
+│  [4] CROSS-REF          [5] VECTORIZE          [6] UPLOAD               │
+│  ────────────────────────────────────────────────────────────────────── │
+│  Match ISRCs to    ───▶ Generate audio    ───▶ Upload to               │
+│  MusicBrainz            feature vectors        Cloudflare               │
+│                                                                          │
+│  [7] INDEX              [8] MINE               [9] VERIFY               │
+│  ────────────────────────────────────────────────────────────────────── │
+│  Create D1         ───▶ Playlist co-      ───▶ Integration             │
+│  indexes                occurrence              tests                    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Import Scripts
+
+```typescript
+// scripts/import-spotify-metadata.ts
+
+interface ImportConfig {
+  sourceDir: string;           // Path to extracted SQLite files
+  r2Bucket: string;            // R2 bucket for database storage
+  d1Database: string;          // D1 database for hot data
+  vectorizeIndex: string;      // Vectorize index name
+  batchSize: number;           // Records per batch
+  skipExisting: boolean;       // Resume interrupted imports
+}
+
+async function importSpotifyMetadata(config: ImportConfig): Promise<void> {
+  console.log('Starting Spotify metadata import...');
+
+  // Phase 1: Upload SQLite databases to R2
+  await uploadDatabases(config);
+
+  // Phase 2: Build ISRC cross-reference
+  await buildCrossReference(config);
+
+  // Phase 3: Cache hot audio features in D1
+  await cacheHotFeatures(config);
+
+  // Phase 4: Generate and upload vectors
+  await vectorizeAudioFeatures(config);
+
+  // Phase 5: Mine playlist co-occurrence
+  await mineCooccurrence(config);
+
+  // Phase 6: Verify import
+  await verifyImport(config);
+
+  console.log('Import complete!');
+}
+
+async function vectorizeAudioFeatures(config: ImportConfig): Promise<void> {
+  const db = await openR2Database(config.r2Bucket, 'spotify_audio_features.db');
+  const vectorize = await getVectorizeIndex(config.vectorizeIndex);
+
+  let processed = 0;
+  const BATCH_SIZE = 1000;
+
+  for await (const batch of streamBatches(db, 'audio_features', BATCH_SIZE)) {
+    const vectors = batch.map(row => ({
+      id: row.id,
+      values: normalizeAudioFeatures(row),
+      metadata: {
+        isrc: row.isrc,
+        title: row.title,
+        artist: row.artist,
+        popularity: row.popularity
+      }
+    }));
+
+    await vectorize.upsert(vectors);
+    processed += batch.length;
+
+    if (processed % 100000 === 0) {
+      console.log(`Vectorized ${processed.toLocaleString()} tracks...`);
+    }
+  }
+}
+```
+
+### Resource Requirements
+
+| Phase | CPU | Memory | Time Estimate |
+|-------|-----|--------|---------------|
+| Download | Low | Low | 1-4 hours (depends on bandwidth) |
+| Decompress | Medium | Medium | 2-4 hours |
+| Cross-reference | High | High | 8-24 hours |
+| Vectorize | High | Medium | 24-48 hours |
+| Co-occurrence mining | High | Very High | 48-72 hours |
+| Upload to Cloudflare | Low | Low | 4-8 hours |
+
+**Recommended:** Run on a dedicated machine with 32GB+ RAM, SSD storage
+
+---
+
+## Operational Considerations
+
+### Freshness Strategy
+
+The dataset has a July 2025 cutoff. Options for handling new releases:
+
+1. **Accept staleness:** For catalog music, 6-month delay is acceptable
+2. **Hybrid approach:** Use Spotify API for tracks not in dataset (requires Spotify API access)
+3. **Periodic updates:** If Anna's Archive releases updates, re-run import
+4. **Fallback chain:** Spotify metadata → MusicBrainz → Last.fm
+
+### Query Patterns
+
+```typescript
+// Hot path: Get audio features for a track
+async function getAudioFeatures(trackId: string): Promise<AudioFeatures | null> {
+  // Try D1 cache first (hot data)
+  const cached = await d1.prepare(
+    'SELECT * FROM spotify_audio_features_cache WHERE spotify_id = ?'
+  ).bind(trackId).first();
+
+  if (cached) return cached as AudioFeatures;
+
+  // Fall back to R2 SQLite (cold data)
+  const db = await getR2Database('spotify_audio_features.db');
+  const result = await db.prepare(
+    'SELECT * FROM audio_features WHERE id = ?'
+  ).bind(trackId).first();
+
+  if (result) {
+    // Warm the cache
+    await cacheAudioFeatures(trackId, result);
+  }
+
+  return result as AudioFeatures | null;
+}
+
+// Vector similarity search
+async function findSimilarByAudioFeatures(
+  seedFeatures: AudioFeatures,
+  limit: number = 50
+): Promise<SimilarTrack[]> {
+  const seedVector = normalizeAudioFeatures(seedFeatures);
+
+  const results = await vectorize.query(seedVector, {
+    topK: limit,
+    returnMetadata: true
+  });
+
+  return results.matches.map(match => ({
+    spotifyId: match.id,
+    similarity: match.score,
+    ...match.metadata
+  }));
+}
+```
+
+### Monitoring
+
+Key metrics to track:
+
+- D1 cache hit rate
+- R2 query latency
+- Vectorize query latency
+- Cross-reference match rate
+- Pipeline scoring distribution
+
+---
+
+## Legal & Ethical Notes
+
+### Data Provenance
+
+The Anna's Archive dataset was obtained by scraping Spotify's API and downloading audio files. This raises legal and ethical considerations:
+
+1. **Copyright:** Track metadata may be protected; audio files definitely are
+2. **Terms of Service:** Scraping violates Spotify's ToS
+3. **GDPR:** Playlist data may contain user information
+
+### Recommended Usage
+
+| Use Case | Recommendation |
+|----------|----------------|
+| Internal similarity matching | ✅ Acceptable |
+| Displaying Spotify branding | ❌ Avoid |
+| Redistributing data | ❌ Do not |
+| Commercial playlist features | ⚠️ Consult legal |
+| Research/analysis | ✅ Acceptable |
+
+### Mitigation Strategies
+
+1. **No Spotify branding:** Never display Spotify logos or claim Spotify affiliation
+2. **Metadata only:** Focus on audio features and relationships, not raw data display
+3. **Fallback sources:** Prefer MusicBrainz/Last.fm for user-facing metadata
+4. **Internal use:** Treat as internal scoring enhancement, not primary data source
+
+---
+
+## Implementation Phases
+
+### Phase 0: Research & Acquisition
+
+- [ ] Download metadata torrents from Anna's Archive
+- [ ] Verify data integrity with provided checksums
+- [ ] Document exact file inventory and sizes
+- [ ] Set up local development environment with SQLite tools
+- [ ] Explore database schemas and sample data
+
+### Phase 1: Storage Setup
+
+- [ ] Create R2 bucket for SQLite databases
+- [ ] Create D1 tables for hot data and cross-references
+- [ ] Create Vectorize index for audio features
+- [ ] Write upload scripts for R2
+- [ ] Test query patterns against R2-hosted SQLite
+
+### Phase 2: Cross-Reference Building
+
+- [ ] Download MusicBrainz ISRC dump (or use API)
+- [ ] Build ISRC → MBID lookup table
+- [ ] Run cross-reference matching pipeline
+- [ ] Analyze match rates and quality
+- [ ] Store results in D1
+
+### Phase 3: Audio Feature Integration
+
+- [ ] Implement audio feature normalization
+- [ ] Generate vectors for all tracks with features
+- [ ] Upload to Vectorize in batches
+- [ ] Implement similarity query functions
+- [ ] Integrate into candidate generation pipeline
+
+### Phase 4: Playlist Mining
+
+- [ ] Implement co-occurrence mining algorithm
+- [ ] Run on playlist dataset (resource-intensive)
+- [ ] Store significant pairs in D1
+- [ ] Implement co-occurrence score function
+- [ ] Integrate into similarity scoring
+
+### Phase 5: Pipeline Integration
+
+- [ ] Update Track Enricher to fetch Spotify features
+- [ ] Update Candidate Generator with new sources
+- [ ] Update Similarity Scorer with new dimensions
+- [ ] Adjust scoring weights based on testing
+- [ ] A/B test old vs new pipeline
+
+### Phase 6: Optimization & Launch
+
+- [ ] Implement D1 caching for hot tracks
+- [ ] Optimize query patterns
+- [ ] Monitor performance and costs
+- [ ] Document operational procedures
+- [ ] Deploy to production
+
+---
+
+## Appendix A: Sample Queries
+
+### Find tracks similar by audio features
+
+```sql
+-- Given a seed track's audio features, this is handled by Vectorize
+-- But for ad-hoc analysis, you can query R2 SQLite:
+
+SELECT
+  t.id,
+  t.name,
+  a.name as artist,
+  af.tempo,
+  af.energy,
+  af.valence,
+  -- Simple Euclidean distance (not cosine, for demo)
+  SQRT(
+    POWER(af.tempo - :seed_tempo, 2) +
+    POWER(af.energy - :seed_energy, 2) +
+    POWER(af.valence - :seed_valence, 2)
+  ) as distance
+FROM audio_features af
+JOIN tracks t ON t.id = af.id
+JOIN artists a ON a.id = JSON_EXTRACT(t.artist_ids, '$[0]')
+ORDER BY distance ASC
+LIMIT 50;
+```
+
+### Find tracks that co-occur in playlists
+
+```sql
+SELECT
+  t.name as track_name,
+  a.name as artist_name,
+  pc.cooccurrence_count,
+  pc.pmi_score,
+  pc.jaccard_score
+FROM playlist_cooccurrence pc
+JOIN tracks t ON t.id = CASE
+  WHEN pc.track_a = :seed_track THEN pc.track_b
+  ELSE pc.track_a
+END
+JOIN artists a ON a.id = JSON_EXTRACT(t.artist_ids, '$[0]')
+WHERE pc.track_a = :seed_track OR pc.track_b = :seed_track
+ORDER BY pc.pmi_score DESC
+LIMIT 50;
+```
+
+### Cross-reference Spotify to MusicBrainz
+
+```sql
+SELECT
+  x.spotify_id,
+  x.isrc,
+  x.mbid,
+  x.match_confidence,
+  st.name as spotify_title,
+  st.popularity
+FROM spotify_mbid_xref x
+JOIN tracks st ON st.id = x.spotify_id
+WHERE x.mbid IS NOT NULL
+  AND x.match_confidence > 0.9
+ORDER BY st.popularity DESC
+LIMIT 100;
+```
+
+---
+
+## Appendix B: Audio Feature Normalization Reference
+
+```typescript
+function normalizeAudioFeatures(features: AudioFeatures): number[] {
+  return [
+    // Tempo: typical range 60-200, normalize to 0-1
+    Math.max(0, Math.min(1, (features.tempo - 60) / 140)),
+
+    // Energy: already 0-1
+    features.energy,
+
+    // Danceability: already 0-1
+    features.danceability,
+
+    // Valence: already 0-1
+    features.valence,
+
+    // Acousticness: already 0-1
+    features.acousticness,
+
+    // Instrumentalness: already 0-1
+    features.instrumentalness,
+
+    // Speechiness: already 0-1
+    features.speechiness,
+
+    // Liveness: already 0-1
+    features.liveness,
+
+    // Loudness: typical range -60 to 0, normalize to 0-1
+    Math.max(0, Math.min(1, (features.loudness + 60) / 60)),
+
+    // Key: 0-11, normalize to 0-1
+    features.key / 11,
+
+    // Mode: 0 or 1
+    features.mode,
+
+    // Time signature: typical range 3-7, normalize to 0-1
+    Math.max(0, Math.min(1, (features.time_signature - 3) / 4)),
+
+    // Popularity: 0-100, normalize to 0-1
+    features.popularity / 100
+  ];
+}
+```
+
+---
+
+## Appendix C: Glossary
+
+| Term | Definition |
+|------|------------|
+| **ISRC** | International Standard Recording Code - unique identifier for recordings |
+| **MBID** | MusicBrainz Identifier - UUID for MusicBrainz entities |
+| **PMI** | Pointwise Mutual Information - measures association strength |
+| **Jaccard** | Jaccard similarity coefficient - intersection over union |
+| **Valence** | Spotify's measure of musical positiveness (0=sad, 1=happy) |
+| **Danceability** | How suitable a track is for dancing (rhythm, tempo, beat strength) |
+| **Vectorize** | Cloudflare's vector database service |
+
+---
+
+*End of Specification*
+
+*Related: [grovemusic-spec.md](./grovemusic-spec.md)*

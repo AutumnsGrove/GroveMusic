@@ -55,8 +55,10 @@
 - [ ] Explore database schemas and sample data
 
 ### Phase S1: Storage Setup
-- [ ] Create R2 bucket for partitioned SQLite databases
-- [ ] Create D1 tables for hot data and cross-references
+- [x] Create R2 bucket for partitioned SQLite databases (SpotifyStorage in sst.config.ts)
+- [x] Create D1 tables for hot data and cross-references (spotify-schema.sql)
+- [x] Create SpotifyMetadataService with 4-layer caching (src/lib/services/spotify.ts)
+- [x] Create promotion cron worker skeleton (workers/spotify-promotion/)
 - [ ] Create Vectorize index for audio features (15M vectors)
 - [ ] Partition source databases by Spotify ID prefix (3,844 partitions)
 - [ ] Upload partitions to R2
@@ -69,10 +71,11 @@
 - [ ] Store results in D1
 
 ### Phase S3: Audio Feature Integration
-- [ ] Implement audio feature normalization (13-dim or 1536-dim hybrid)
+- [x] Implement audio feature normalization (13-dim in types/index.ts)
+- [x] Implement similarity query functions (SpotifyMetadataService)
+- [x] Implement co-occurrence score functions (SpotifyMetadataService)
 - [ ] Generate vectors for popular tracks (popularity ≥ 30)
 - [ ] Upload to Vectorize in batches
-- [ ] Implement similarity query functions
 - [ ] Integrate into candidate generation pipeline
 
 ### Phase S4: Playlist Mining

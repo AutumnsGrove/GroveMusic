@@ -1,38 +1,52 @@
 # GroveMusic TODOs
 
-## Phase 0: Foundation (Current)
-- [x] Set up Cloudflare project structure (wrangler.toml)
-- [x] Configure D1 database with schema
+## Current Status: Phase S1 (Spotify Integration) + Phase 1 (Core Pipeline)
+
+We're building out the Spotify metadata integration service layer while the
+core pipeline services are already in place. Torrenting not yet available.
+
+---
+
+## Phase 0: Foundation ✅ Complete
+- [x] Set up Cloudflare project structure (sst.config.ts)
+- [x] Configure D1 database with schema (schema.sql)
 - [x] Set up KV namespaces (CACHE, SESSIONS, RATE_LIMITS, CONFIG)
 - [x] Create Vectorize index (grovemusic-tracks)
 - [x] Set up R2 bucket (grovemusic-storage)
-- [ ] Implement Google OAuth
+- [x] Implement Heartwood OAuth (src/lib/services/auth.ts)
 - [x] Basic SvelteKit shell with landing page
+- [x] TypeScript types for all data models (src/lib/types/index.ts)
 
-## Phase 1: Core Pipeline
-- [ ] Track Resolver Worker (MusicBrainz + Last.fm)
-- [ ] Track Enricher Worker
-- [ ] Candidate Generator Worker
-- [ ] Similarity Scorer Worker
-- [ ] Pipeline Durable Object orchestration
-- [ ] Basic progress tracking
+## Phase 1: Core Pipeline (Services Ready, Orchestration Pending)
+- [x] Last.fm service (src/lib/services/lastfm.ts)
+- [x] MusicBrainz service (src/lib/services/musicbrainz.ts)
+- [x] Pipeline Durable Object skeleton (workers/pipeline/)
+- [x] API routes: /api/generate, /api/runs, /api/auth/*
+- [ ] Wire up Track Resolver stage
+- [ ] Wire up Track Enricher stage
+- [ ] Wire up Candidate Generator stage
+- [ ] Wire up Similarity Scorer stage
+- [ ] Test end-to-end pipeline flow
 
-## Phase 2: LLM Integration
-- [ ] LLM provider abstraction
-- [ ] Claude integration
-- [ ] Prompt templates for explanations
-- [ ] Playlist ordering logic
+## Phase 2: LLM Integration (Service Ready, Integration Pending)
+- [x] LLM service with Claude support (src/lib/services/llm.ts)
+- [x] Track explanation generation
+- [x] Playlist ordering logic
+- [ ] Prompt templates stored in KV
+- [ ] Integrate into pipeline curating stage
 
-## Phase 3: Frontend
-- [ ] Seed track input UI (`SeedTrackInput.svelte`)
-- [ ] Pipeline progress view (`PipelineProgress.svelte`)
-- [ ] Playlist display (JSON + Markdown views)
+## Phase 3: Frontend (Components Created, Wiring Pending)
+- [x] Seed track input UI (SeedTrackInput.svelte)
+- [x] Pipeline progress view (PipelineProgress.svelte)
+- [x] Playlist display component (PlaylistView.svelte)
+- [x] User credits component (UserCredits.svelte)
 - [ ] User history page
 - [ ] Profile/credits page
 
 ## Phase 4: Credit System
-- [ ] Credit checking/reservation logic
-- [ ] Transaction logging
+- [x] Credit types and calculations (src/lib/types/index.ts)
+- [x] Credit reservation in /api/generate
+- [ ] Transaction logging to D1
 - [ ] Basic subscription tiers
 - [ ] Stripe integration (optional)
 
@@ -93,8 +107,8 @@
 - [ ] A/B test old vs new pipeline
 
 ### Phase S6: Optimization & Launch
-- [ ] Implement dynamic vector promotion (3+ queries → Vectorize)
-- [ ] Set up cron job for background promotion
+- [x] Implement dynamic vector promotion logic (SpotifyMetadataService.recordAccess)
+- [x] Set up cron job for background promotion (workers/spotify-promotion/)
 - [ ] Monitor performance and costs (~$6/month target)
 - [ ] Document operational procedures
 - [ ] Deploy to production
@@ -102,20 +116,24 @@
 ---
 
 ## Immediate Next Steps
-1. ~~Run `pnpm install` to install dependencies~~ ✅
-2. ~~Set up Cloudflare resources (D1, KV, R2, Vectorize)~~ ✅
-3. Get Last.fm API key from https://www.last.fm/api/account/create
-4. Set up Google OAuth credentials in Google Cloud Console
-5. Get Anthropic API key from https://console.anthropic.com
-6. Copy `secrets_template.json` to `secrets.json` and fill in values
-7. Run `pnpm dev` to start local development
 
----
+### For Core Pipeline (can do now):
+1. Wire up pipeline stages in workers/pipeline/src/index.ts
+2. Test Last.fm + MusicBrainz resolution flow
+3. Implement candidate generation with existing services
+4. Test end-to-end playlist generation
 
-## API Keys Needed
-- [ ] Last.fm API key
-- [ ] Google OAuth Client ID/Secret
-- [ ] Anthropic API key (for Claude)
+### For Spotify Integration (blocked on torrents):
+1. Download metadata torrents from Anna's Archive
+2. Partition databases using scripts in spotify-metadata-spec.md
+3. Upload partitions to R2: `pnpm wrangler r2 object put ...`
+4. Apply schema: `pnpm wrangler d1 execute grovemusic-spotify-cache --file=spotify-schema.sql`
+5. Run cross-reference matching pipeline
+
+### API Keys Needed
+- [ ] Last.fm API key - https://www.last.fm/api/account/create
+- [ ] Heartwood OAuth (Grove SSO) - already configured
+- [ ] Anthropic API key - https://console.anthropic.com
 - [ ] Cloudflare Account ID & API Token
 
 ---

@@ -287,3 +287,208 @@ export const CREDIT_COSTS: Record<number, number> = {
 	75: 3,
 	100: 4
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Spotify Audio Features Types (from spotify-metadata-spec.md)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Spotify audio features for a track.
+ * All 0-1 features are derived from machine learning models.
+ */
+export interface AudioFeatures {
+	spotifyId: string; // Spotify base62 track ID
+	tempo: number; // BPM (typically 60-200)
+	timeSignature: number; // Beats per bar (typically 3-7)
+	key: number; // Pitch class (0-11, where 0=C, 1=C#, etc.)
+	mode: number; // Major (1) or Minor (0)
+	loudness: number; // dB (typically -60 to 0)
+	energy: number; // 0.0-1.0: Intensity and activity
+	danceability: number; // 0.0-1.0: Suitability for dancing
+	speechiness: number; // 0.0-1.0: Presence of spoken words
+	acousticness: number; // 0.0-1.0: Acoustic vs electronic
+	instrumentalness: number; // 0.0-1.0: Lack of vocals
+	liveness: number; // 0.0-1.0: Live audience presence
+	valence: number; // 0.0-1.0: Musical positiveness (happy vs sad)
+	durationMs?: number; // Track duration in milliseconds
+	popularity?: number; // 0-100 at time of snapshot
+}
+
+/**
+ * Result of cross-referencing a Spotify track to MusicBrainz.
+ */
+export interface CrossRefResult {
+	spotifyId: string;
+	isrc: string;
+	mbid: string | null;
+	confidence: number;
+	method: 'isrc_exact' | 'isrc_fuzzy' | 'metadata_match' | 'no_match';
+}
+
+/**
+ * Track similarity result from Vectorize or precomputed cache.
+ */
+export interface SimilarTrack {
+	spotifyId: string;
+	similarity: number; // 0-1 cosine similarity
+	title?: string;
+	artist?: string;
+	popularity?: number;
+	isrc?: string;
+	mbid?: string;
+}
+
+/**
+ * Playlist co-occurrence data between two tracks.
+ */
+export interface CooccurrenceData {
+	trackA: string; // Spotify ID (lower alphabetically)
+	trackB: string; // Spotify ID (higher alphabetically)
+	cooccurrenceCount: number; // Number of playlists containing both
+	pmiScore: number; // Pointwise Mutual Information
+	jaccardScore: number; // Jaccard similarity coefficient
+}
+
+/**
+ * Enhanced similarity scores including Spotify data.
+ */
+export interface EnhancedSimilarityScores {
+	tagOverlap: number; // 0-1 from Last.fm
+	audioFeature: number; // 0-1 from Spotify features
+	playlistCooccurrence: number; // 0-1 from playlist mining
+	artistSimilarity: number; // 0-1 from Last.fm/MB
+	temporalProximity: number; // 0-1 based on release year
+	popularityFit: number; // 0-1 based on user preference
+}
+
+/**
+ * Scoring weights for similarity calculation.
+ */
+export const SIMILARITY_WEIGHTS = {
+	tagOverlap: 0.15,
+	audioFeature: 0.25, // Major signal from Spotify
+	playlistCooccurrence: 0.25, // Major signal from Spotify
+	artistSimilarity: 0.15,
+	temporalProximity: 0.1,
+	popularityFit: 0.1
+} as const;
+
+/**
+ * Normalize audio features to a 13-dimensional vector.
+ */
+export function normalizeAudioFeatures(features: AudioFeatures): number[] {
+	return [
+		// Tempo: typical range 60-200, normalize to 0-1
+		Math.max(0, Math.min(1, (features.tempo - 60) / 140)),
+		// Energy: already 0-1
+		features.energy,
+		// Danceability: already 0-1
+		features.danceability,
+		// Valence: already 0-1
+		features.valence,
+		// Acousticness: already 0-1
+		features.acousticness,
+		// Instrumentalness: already 0-1
+		features.instrumentalness,
+		// Speechiness: already 0-1
+		features.speechiness,
+		// Liveness: already 0-1
+		features.liveness,
+		// Loudness: typical range -60 to 0, normalize to 0-1
+		Math.max(0, Math.min(1, (features.loudness + 60) / 60)),
+		// Key: 0-11, normalize to 0-1
+		features.key / 11,
+		// Mode: 0 or 1
+		features.mode,
+		// Time signature: typical range 3-7, normalize to 0-1
+		Math.max(0, Math.min(1, (features.timeSignature - 3) / 4)),
+		// Popularity: 0-100, normalize to 0-1
+		(features.popularity ?? 50) / 100
+	];
+}
+
+/**
+ * Compute cosine similarity between two vectors.
+ */
+export function cosineSimilarity(a: number[], b: number[]): number {
+	if (a.length !== b.length) {
+		throw new Error(`Vector length mismatch: ${a.length} vs ${b.length}`);
+	}
+
+	let dotProduct = 0;
+	let normA = 0;
+	let normB = 0;
+
+	for (let i = 0; i < a.length; i++) {
+		dotProduct += a[i] * b[i];
+		normA += a[i] * a[i];
+		normB += b[i] * b[i];
+	}
+
+	const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+	return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+/**
+ * Compute overall similarity score from individual dimensions.
+ */
+export function computeOverallScore(scores: EnhancedSimilarityScores): number {
+	return (
+		Object.entries(SIMILARITY_WEIGHTS).reduce(
+			(sum, [key, weight]) => sum + scores[key as keyof EnhancedSimilarityScores] * weight,
+			0
+		) * 10
+	); // Scale to 0-10
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Cache Key Patterns
+// ─────────────────────────────────────────────────────────────────────────────
+
+export const CACHE_KEYS = {
+	// Last.fm cache keys
+	lastfmTrack: (mbid: string) => `lastfm:track:${mbid}`,
+	lastfmSimilar: (mbid: string) => `lastfm:similar:${mbid}`,
+	lastfmArtist: (mbid: string) => `lastfm:artist:${mbid}`,
+
+	// MusicBrainz cache keys
+	mbRecording: (mbid: string) => `mb:recording:${mbid}`,
+	mbArtist: (mbid: string) => `mb:artist:${mbid}`,
+
+	// Spotify cache keys
+	spotifyAudioFeatures: (spotifyId: string) => `spotify:af:${spotifyId}`,
+	spotifyCrossRef: (spotifyId: string) => `spotify:xref:${spotifyId}`,
+	spotifyIsrcLookup: (isrc: string) => `spotify:isrc:${isrc}`,
+	spotifySimilarityResults: (seedId: string, limit: number) => `spotify:sim:${seedId}:${limit}`,
+	spotifyCooccurrence: (trackA: string, trackB: string) => {
+		const [a, b] = [trackA, trackB].sort();
+		return `spotify:cooc:${a}:${b}`;
+	},
+	spotifyTopSimilar: (trackId: string) => `spotify:topsim:${trackId}`,
+
+	// Query resolution cache
+	resolvedQuery: (queryHash: string) => `resolved:${queryHash}`,
+
+	// Rate limiting
+	rateLimit: (userId: string, date: string) => `rate:${userId}:${date}`,
+
+	// LLM prompts
+	prompt: (name: string) => `prompt:${name}`
+} as const;
+
+/** Cache TTLs in seconds */
+export const CACHE_TTLS = {
+	lastfmTrack: 24 * 60 * 60, // 24 hours
+	lastfmSimilar: 7 * 24 * 60 * 60, // 7 days
+	lastfmArtist: 24 * 60 * 60, // 24 hours
+	mbRecording: 30 * 24 * 60 * 60, // 30 days
+	spotifyAudioFeatures: 7 * 24 * 60 * 60, // 7 days
+	spotifyCrossRef: 30 * 24 * 60 * 60, // 30 days
+	spotifyIsrcLookup: 30 * 24 * 60 * 60, // 30 days
+	spotifySimilarityResults: 1 * 60 * 60, // 1 hour
+	spotifyCooccurrence: 7 * 24 * 60 * 60, // 7 days
+	spotifyTopSimilar: 7 * 24 * 60 * 60, // 7 days
+	resolvedQuery: 7 * 24 * 60 * 60, // 7 days
+	rateLimit: 24 * 60 * 60, // 24 hours
+	prompt: 1 * 60 * 60 // 1 hour
+} as const;

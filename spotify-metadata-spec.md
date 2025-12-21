@@ -1,6 +1,6 @@
 # Spotify Metadata Integration Specification
 
-**Version:** 1.1.0
+**Version:** 1.3.0
 **Last Updated:** December 21, 2025
 **Status:** Research/Planning
 **Parent Spec:** grovemusic-spec.md
@@ -293,6 +293,279 @@ See [Cost Analysis & Optimization](#cost-analysis--optimization) for detailed pr
 
 ---
 
+## R2 Database Partitioning Strategy
+
+The source SQLite databases are too large to load into Worker memory (128MB limit). We must partition them for practical querying.
+
+### The Problem
+
+```
+❌ WRONG: Load entire database into memory
+const dbFile = await Resource.SpotifyStorage.get("spotify_audio_features.db");
+const buffer = await dbFile.arrayBuffer();  // 4TB into memory = instant OOM
+```
+
+### Partitioning Scheme
+
+Partition databases by Spotify ID prefix (first 2 characters of base62 ID):
+
+```
+spotify_audio_features/
+├── aa.db    # Tracks starting with "aa" (~65K tracks, ~10MB)
+├── ab.db    # Tracks starting with "ab" (~65K tracks, ~10MB)
+├── ac.db
+├── ...
+└── zz.db    # 62 × 62 = 3,844 partitions
+```
+
+**Math:**
+- 256M tracks ÷ 3,844 partitions = ~66,600 tracks per partition
+- ~150 bytes per audio feature row × 66,600 = ~10MB per partition
+- Well under Worker memory limits
+
+### R2 Object Layout
+
+```
+grovemusic-spotify-storage/
+├── audio_features/
+│   ├── aa.db
+│   ├── ab.db
+│   └── ...
+├── tracks/
+│   ├── aa.db
+│   ├── ab.db
+│   └── ...
+├── artists/
+│   └── artists.db          # Small enough for single file (~5GB)
+├── albums/
+│   ├── aa.db
+│   └── ...
+└── playlists/
+    ├── playlists.db        # Playlist metadata
+    └── tracks/
+        ├── aa.db           # Playlist-track relationships by playlist ID prefix
+        └── ...
+```
+
+### Partition Lookup Implementation
+
+```typescript
+import { Resource } from "sst";
+
+/**
+ * Get the R2 partition key for a Spotify ID.
+ * Uses first 2 characters of base62 ID.
+ */
+function getPartitionKey(spotifyId: string): string {
+  return spotifyId.slice(0, 2).toLowerCase();
+}
+
+/**
+ * Fetch audio features from the correct R2 partition.
+ */
+async function fetchFromR2Partitioned(spotifyId: string): Promise<AudioFeatures | null> {
+  const partition = getPartitionKey(spotifyId);
+  const dbPath = `audio_features/${partition}.db`;
+
+  // Fetch only the small partition file (~10MB)
+  const dbFile = await Resource.SpotifyStorage.get(dbPath);
+  if (!dbFile) {
+    console.warn(`Partition not found: ${dbPath}`);
+    return null;
+  }
+
+  // Load partition into memory (safe: ~10MB)
+  const SQL = await initSqlJs();
+  const buffer = await dbFile.arrayBuffer();
+  const db = new SQL.Database(new Uint8Array(buffer));
+
+  try {
+    const result = db.exec(
+      `SELECT * FROM audio_features WHERE id = ?`,
+      [spotifyId]
+    );
+
+    if (result.length === 0 || result[0].values.length === 0) {
+      return null;
+    }
+
+    // Map row to AudioFeatures interface
+    const columns = result[0].columns;
+    const values = result[0].values[0];
+    const row: Record<string, unknown> = {};
+    columns.forEach((col, i) => { row[col] = values[i]; });
+
+    return row as AudioFeatures;
+  } finally {
+    db.close();
+  }
+}
+
+/**
+ * Batch fetch from multiple partitions efficiently.
+ * Groups IDs by partition to minimize R2 fetches.
+ */
+async function batchFetchFromR2(
+  spotifyIds: string[]
+): Promise<Map<string, AudioFeatures>> {
+  // Group by partition
+  const byPartition = new Map<string, string[]>();
+  for (const id of spotifyIds) {
+    const partition = getPartitionKey(id);
+    if (!byPartition.has(partition)) {
+      byPartition.set(partition, []);
+    }
+    byPartition.get(partition)!.push(id);
+  }
+
+  const results = new Map<string, AudioFeatures>();
+
+  // Fetch partitions in parallel (limit concurrency)
+  const CONCURRENCY = 5;
+  const partitions = Array.from(byPartition.entries());
+
+  for (let i = 0; i < partitions.length; i += CONCURRENCY) {
+    const batch = partitions.slice(i, i + CONCURRENCY);
+
+    await Promise.all(batch.map(async ([partition, ids]) => {
+      const dbPath = `audio_features/${partition}.db`;
+      const dbFile = await Resource.SpotifyStorage.get(dbPath);
+      if (!dbFile) return;
+
+      const SQL = await initSqlJs();
+      const buffer = await dbFile.arrayBuffer();
+      const db = new SQL.Database(new Uint8Array(buffer));
+
+      try {
+        const placeholders = ids.map(() => '?').join(',');
+        const result = db.exec(
+          `SELECT * FROM audio_features WHERE id IN (${placeholders})`,
+          ids
+        );
+
+        if (result.length > 0) {
+          const columns = result[0].columns;
+          for (const values of result[0].values) {
+            const row: Record<string, unknown> = {};
+            columns.forEach((col, i) => { row[col] = values[i]; });
+            results.set(row.id as string, row as AudioFeatures);
+          }
+        }
+      } finally {
+        db.close();
+      }
+    }));
+  }
+
+  return results;
+}
+```
+
+### Import Script: Partitioning Source Data
+
+```typescript
+// scripts/partition-spotify-data.ts
+import Database from 'better-sqlite3';
+import * as fs from 'fs';
+import * as path from 'path';
+
+interface PartitionConfig {
+  sourceDb: string;          // Path to original SQLite file
+  outputDir: string;         // Output directory for partitions
+  tableName: string;         // Table to partition
+  idColumn: string;          // Column containing Spotify ID
+}
+
+async function partitionDatabase(config: PartitionConfig): Promise<void> {
+  const { sourceDb, outputDir, tableName, idColumn } = config;
+
+  fs.mkdirSync(outputDir, { recursive: true });
+
+  const source = new Database(sourceDb, { readonly: true });
+  const partitions = new Map<string, Database.Database>();
+
+  // Stream through all rows
+  const stmt = source.prepare(`SELECT * FROM ${tableName}`);
+
+  let processed = 0;
+  for (const row of stmt.iterate()) {
+    const id = row[idColumn] as string;
+    const partition = id.slice(0, 2).toLowerCase();
+
+    // Get or create partition database
+    if (!partitions.has(partition)) {
+      const partitionPath = path.join(outputDir, `${partition}.db`);
+      const partitionDb = new Database(partitionPath);
+
+      // Clone schema from source
+      const schema = source.prepare(
+        `SELECT sql FROM sqlite_master WHERE type='table' AND name=?`
+      ).get(tableName) as { sql: string };
+      partitionDb.exec(schema.sql);
+
+      partitions.set(partition, partitionDb);
+    }
+
+    // Insert row into partition
+    const db = partitions.get(partition)!;
+    const columns = Object.keys(row);
+    const placeholders = columns.map(() => '?').join(',');
+    db.prepare(
+      `INSERT INTO ${tableName} (${columns.join(',')}) VALUES (${placeholders})`
+    ).run(...Object.values(row));
+
+    processed++;
+    if (processed % 1_000_000 === 0) {
+      console.log(`Processed ${(processed / 1_000_000).toFixed(1)}M rows...`);
+    }
+  }
+
+  // Create indexes and close all partitions
+  for (const [partition, db] of partitions) {
+    db.exec(`CREATE INDEX IF NOT EXISTS idx_id ON ${tableName}(${idColumn})`);
+    db.close();
+    console.log(`Closed partition: ${partition}.db`);
+  }
+
+  source.close();
+  console.log(`Done! Partitioned ${processed.toLocaleString()} rows into ${partitions.size} files`);
+}
+
+// Usage
+await partitionDatabase({
+  sourceDb: '/data/spotify_audio_features.db',
+  outputDir: '/data/partitioned/audio_features',
+  tableName: 'audio_features',
+  idColumn: 'id'
+});
+```
+
+### Upload Partitions to R2
+
+```bash
+# Upload all partitions to R2 (using wrangler)
+for file in /data/partitioned/audio_features/*.db; do
+  partition=$(basename "$file")
+  echo "Uploading $partition..."
+  pnpm wrangler r2 object put grovemusic-spotify-storage/audio_features/$partition \
+    --file="$file" \
+    --content-type="application/x-sqlite3"
+done
+```
+
+### Partition Size Estimates
+
+| Database | Total Size | Partitions | Per-Partition |
+|----------|------------|------------|---------------|
+| audio_features | ~4TB compressed | 3,844 | ~1GB each |
+| tracks | ~50GB | 3,844 | ~13MB each |
+| albums | ~15GB | 3,844 | ~4MB each |
+| playlists | ~100GB | 3,844 | ~26MB each |
+
+**Note:** Audio features are compressed in the source. Uncompressed per-partition sizes may be smaller due to the distribution of track IDs.
+
+---
+
 ## Caching Strategy
 
 Aggressive caching is critical for cost optimization and performance. Every cache hit saves an R2 read, D1 query, or Vectorize lookup.
@@ -446,22 +719,42 @@ class SpotifyMetadataCache {
   }
 
   private async fetchFromR2(spotifyId: string): Promise<AudioFeatures | null> {
-    // Fetch SQLite database from R2 and query with sql.js
-    const dbFile = await Resource.SpotifyStorage.get("spotify_audio_features.db");
-    if (!dbFile) return null;
+    // Use partitioned databases - see "R2 Database Partitioning Strategy" section
+    // Partition by first 2 chars of Spotify ID to keep each file ~10MB
+    const partition = spotifyId.slice(0, 2).toLowerCase();
+    const dbPath = `audio_features/${partition}.db`;
 
-    // Load with sql.js (WASM SQLite)
+    const dbFile = await Resource.SpotifyStorage.get(dbPath);
+    if (!dbFile) {
+      console.warn(`Partition not found: ${dbPath}`);
+      return null;
+    }
+
+    // Load partition with sql.js (WASM SQLite) - safe since partition is ~10MB
     const SQL = await initSqlJs();
     const buffer = await dbFile.arrayBuffer();
     const db = new SQL.Database(new Uint8Array(buffer));
 
-    const result = db.exec(
-      `SELECT * FROM audio_features WHERE id = ?`,
-      [spotifyId]
-    );
+    try {
+      const result = db.exec(
+        `SELECT * FROM audio_features WHERE id = ?`,
+        [spotifyId]
+      );
 
-    db.close();
-    return result[0]?.values[0] as AudioFeatures | null;
+      if (result.length === 0 || result[0].values.length === 0) {
+        return null;
+      }
+
+      // Map row to AudioFeatures interface
+      const columns = result[0].columns;
+      const values = result[0].values[0];
+      const row: Record<string, unknown> = {};
+      columns.forEach((col, i) => { row[col] = values[i]; });
+
+      return row as AudioFeatures;
+    } finally {
+      db.close();
+    }
   }
 
   private async cacheInD1(spotifyId: string, features: AudioFeatures): Promise<void> {
@@ -542,11 +835,11 @@ interface PromotionConfig {
 }
 
 async function promoteTracksToVectorize(
-  config: PromotionConfig,
-  cache: SpotifyMetadataCache
+  config: PromotionConfig
 ): Promise<number> {
   // Find tracks with high access counts not yet in Vectorize
-  const candidates = await cache.d1.prepare(`
+  // Using SST Resource SDK for type-safe access
+  const candidates = await Resource.SpotifyCache.prepare(`
     SELECT
       tal.spotify_id,
       tal.access_count,
@@ -575,11 +868,13 @@ async function promoteTracksToVectorize(
     }
   }));
 
-  await cache.vectorize.upsert(vectors);
+  // Note: Vectorize may require manual wrangler setup until SST adds full support
+  // await Resource.SpotifyTracks.upsert(vectors);
+  await vectorizeIndex.upsert(vectors);
 
   // Mark as vectorized
   const ids = candidates.results.map(r => r.spotify_id);
-  await cache.d1.prepare(`
+  await Resource.SpotifyCache.prepare(`
     UPDATE track_access_log SET vectorized = 1 WHERE spotify_id IN (${ids.map(() => '?').join(',')})
   `).bind(...ids).run();
 
@@ -738,16 +1033,19 @@ pnpm sst deploy --stage production
 For the most popular tracks, precompute and cache similarity results:
 
 ```typescript
+import { Resource } from "sst";
+
 // Precompute top 100 similar tracks for top 100K popular tracks
+// Run this as a batch job, not during user requests
 async function precomputeTopSimilar(
-  cache: SpotifyMetadataCache,
-  vectorize: VectorizeIndex
+  vectorizeIndex: VectorizeIndex,
+  cache: SpotifyMetadataCache
 ): Promise<void> {
   const POPULAR_TRACK_LIMIT = 100_000;
   const SIMILAR_PER_TRACK = 100;
 
-  // Get most popular tracks
-  const popularTracks = await cache.d1.prepare(`
+  // Get most popular tracks using SST Resource SDK
+  const popularTracks = await Resource.SpotifyCache.prepare(`
     SELECT spotify_id, popularity
     FROM spotify_audio_features_cache
     ORDER BY popularity DESC
@@ -758,7 +1056,7 @@ async function precomputeTopSimilar(
     const spotifyId = track.spotify_id as string;
 
     // Check if already computed
-    const existing = await cache.kv.get(CACHE_KEYS.topSimilar(spotifyId));
+    const existing = await Resource.SpotifyKV.get(CACHE_KEYS.topSimilar(spotifyId));
     if (existing) continue;
 
     // Get audio features and find similar
@@ -766,13 +1064,13 @@ async function precomputeTopSimilar(
     if (!features) continue;
 
     const vector = normalizeAudioFeatures(features);
-    const similar = await vectorize.query(vector, {
+    const similar = await vectorizeIndex.query(vector, {
       topK: SIMILAR_PER_TRACK,
       returnMetadata: true
     });
 
     // Cache the results
-    await cache.kv.put(
+    await Resource.SpotifyKV.put(
       CACHE_KEYS.topSimilar(spotifyId),
       JSON.stringify(similar.matches),
       { expirationTtl: CACHE_TTLS.topSimilar }
@@ -812,6 +1110,70 @@ async function recordCacheMetric(metric: CacheMetrics): Promise<void> {
 ---
 
 ## Schema Design
+
+### TypeScript Type Definitions
+
+Core interfaces used throughout the codebase:
+
+```typescript
+/**
+ * Spotify audio features for a track.
+ * All 0-1 features are derived from machine learning models.
+ * See "Audio Features Deep Dive" section for detailed descriptions.
+ */
+interface AudioFeatures {
+  spotify_id: string;           // Spotify base62 track ID
+  tempo: number;                // BPM (typically 60-200)
+  time_signature: number;       // Beats per bar (typically 3-7)
+  key: number;                  // Pitch class (0-11, where 0=C, 1=C#, etc.)
+  mode: number;                 // Major (1) or Minor (0)
+  loudness: number;             // dB (typically -60 to 0)
+  energy: number;               // 0.0-1.0: Intensity and activity
+  danceability: number;         // 0.0-1.0: Suitability for dancing
+  speechiness: number;          // 0.0-1.0: Presence of spoken words
+  acousticness: number;         // 0.0-1.0: Acoustic vs electronic
+  instrumentalness: number;     // 0.0-1.0: Lack of vocals
+  liveness: number;             // 0.0-1.0: Live audience presence
+  valence: number;              // 0.0-1.0: Musical positiveness (happy vs sad)
+  duration_ms?: number;         // Track duration in milliseconds
+  popularity?: number;          // 0-100 at time of snapshot
+}
+
+/**
+ * Result of cross-referencing a Spotify track to MusicBrainz.
+ */
+interface CrossRefResult {
+  spotifyId: string;
+  isrc: string;
+  mbid: string | null;
+  confidence: number;
+  method: 'isrc_exact' | 'isrc_fuzzy' | 'metadata_match' | 'no_match';
+}
+
+/**
+ * Track similarity result from Vectorize or precomputed cache.
+ */
+interface SimilarTrack {
+  spotifyId: string;
+  similarity: number;           // 0-1 cosine similarity
+  title?: string;
+  artist?: string;
+  popularity?: number;
+  isrc?: string;
+  mbid?: string;
+}
+
+/**
+ * Playlist co-occurrence data between two tracks.
+ */
+interface CooccurrenceData {
+  trackA: string;               // Spotify ID (lower alphabetically)
+  trackB: string;               // Spotify ID (higher alphabetically)
+  cooccurrenceCount: number;    // Number of playlists containing both
+  pmiScore: number;             // Pointwise Mutual Information
+  jaccardScore: number;         // Jaccard similarity coefficient
+}
+```
 
 ### D1 Schema: Cross-Reference Tables
 
@@ -1498,37 +1860,65 @@ The dataset has a July 2025 cutoff. Options for handling new releases:
 ### Query Patterns
 
 ```typescript
+import { Resource } from "sst";
+
 // Hot path: Get audio features for a track
+// Uses SST Resource SDK for type-safe Cloudflare bindings
 async function getAudioFeatures(trackId: string): Promise<AudioFeatures | null> {
   // Try D1 cache first (hot data)
-  const cached = await d1.prepare(
+  const cached = await Resource.SpotifyCache.prepare(
     'SELECT * FROM spotify_audio_features_cache WHERE spotify_id = ?'
   ).bind(trackId).first();
 
   if (cached) return cached as AudioFeatures;
 
-  // Fall back to R2 SQLite (cold data)
-  const db = await getR2Database('spotify_audio_features.db');
-  const result = await db.prepare(
-    'SELECT * FROM audio_features WHERE id = ?'
-  ).bind(trackId).first();
+  // Fall back to R2 SQLite (cold data) - using partitioned approach
+  // See "R2 Database Partitioning Strategy" section
+  const partition = trackId.slice(0, 2).toLowerCase();
+  const dbPath = `audio_features/${partition}.db`;
 
-  if (result) {
-    // Warm the cache
-    await cacheAudioFeatures(trackId, result);
+  const dbFile = await Resource.SpotifyStorage.get(dbPath);
+  if (!dbFile) return null;
+
+  const SQL = await initSqlJs();
+  const buffer = await dbFile.arrayBuffer();
+  const db = new SQL.Database(new Uint8Array(buffer));
+
+  try {
+    const result = db.exec(
+      'SELECT * FROM audio_features WHERE id = ?',
+      [trackId]
+    );
+
+    if (result.length === 0 || result[0].values.length === 0) {
+      return null;
+    }
+
+    // Map to AudioFeatures
+    const columns = result[0].columns;
+    const values = result[0].values[0];
+    const features: Record<string, unknown> = {};
+    columns.forEach((col, i) => { features[col] = values[i]; });
+
+    // Warm the cache for next time
+    await cacheAudioFeatures(trackId, features as AudioFeatures);
+
+    return features as AudioFeatures;
+  } finally {
+    db.close();
   }
-
-  return result as AudioFeatures | null;
 }
 
 // Vector similarity search
+// Note: Vectorize binding may require manual wrangler setup until SST adds full support
 async function findSimilarByAudioFeatures(
   seedFeatures: AudioFeatures,
+  vectorizeIndex: VectorizeIndex,
   limit: number = 50
 ): Promise<SimilarTrack[]> {
   const seedVector = normalizeAudioFeatures(seedFeatures);
 
-  const results = await vectorize.query(seedVector, {
+  const results = await vectorizeIndex.query(seedVector, {
     topK: limit,
     returnMetadata: true
   });

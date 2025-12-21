@@ -65,6 +65,11 @@ export default $config({
 				rateLimits,
 				config,
 				storage,
+				// Spotify metadata resources
+				spotifyCache,
+				spotifyKV,
+				spotifyStorage,
+				// Secrets
 				lastfmApiKey,
 				anthropicApiKey,
 				heartwoodClientId,

@@ -1,6 +1,6 @@
 # Spotify Metadata Integration Specification
 
-**Version:** 1.3.0
+**Version:** 1.4.0
 **Last Updated:** December 21, 2025
 **Status:** Research/Planning
 **Parent Spec:** grovemusic-spec.md
@@ -30,16 +30,18 @@ This specification details how Aria can leverage the Anna's Archive Spotify meta
 2. [Dataset Inventory](#dataset-inventory)
 3. [Cost Analysis & Optimization](#cost-analysis--optimization)
 4. [Storage Architecture](#storage-architecture)
-5. [Caching Strategy](#caching-strategy)
-6. [Schema Design](#schema-design)
-7. [Cross-Reference Strategy](#cross-reference-strategy)
-8. [Pipeline Integration](#pipeline-integration)
-9. [Audio Features Deep Dive](#audio-features-deep-dive)
-10. [Playlist Co-occurrence Mining](#playlist-co-occurrence-mining)
-11. [Import Pipeline](#import-pipeline)
-12. [Operational Considerations](#operational-considerations)
-13. [Legal & Ethical Notes](#legal--ethical-notes)
-14. [Implementation Phases](#implementation-phases)
+5. [R2 Database Partitioning Strategy](#r2-database-partitioning-strategy)
+6. [Caching Strategy](#caching-strategy)
+7. [Schema Design](#schema-design)
+8. [Helper Functions Reference](#helper-functions-reference)
+9. [Cross-Reference Strategy](#cross-reference-strategy)
+10. [Pipeline Integration](#pipeline-integration)
+11. [Audio Features Deep Dive](#audio-features-deep-dive)
+12. [Playlist Co-occurrence Mining](#playlist-co-occurrence-mining)
+13. [Import Pipeline](#import-pipeline)
+14. [Operational Considerations](#operational-considerations)
+15. [Legal & Ethical Notes](#legal--ethical-notes)
+16. [Implementation Phases](#implementation-phases)
 
 ---
 
@@ -295,7 +297,17 @@ See [Cost Analysis & Optimization](#cost-analysis--optimization) for detailed pr
 
 ## R2 Database Partitioning Strategy
 
-The source SQLite databases are too large to load into Worker memory (128MB limit). We must partition them for practical querying.
+The source SQLite databases are too large to load into Worker memory. We must partition them for practical querying.
+
+### Worker Memory Limits
+
+| Plan | Memory Limit | Notes |
+|------|--------------|-------|
+| Free | 128 MB | Very constrained |
+| **Paid (Bundled)** | **128 MB** | Same as free |
+| **Paid (Unbound)** | **Up to 256 MB** | Better for sql.js |
+
+With the Workers paid plan (Unbound), we have up to 256MB memory. However, sql.js itself uses ~20-30MB, leaving ~200MB for actual data. Partition sizes should stay under **50MB** to be safe with overhead.
 
 ### The Problem
 
@@ -380,18 +392,21 @@ async function fetchFromR2Partitioned(spotifyId: string): Promise<AudioFeatures 
   const db = new SQL.Database(new Uint8Array(buffer));
 
   try {
-    const result = db.exec(
-      `SELECT * FROM audio_features WHERE id = ?`,
-      [spotifyId]
-    );
+    // sql.js requires prepare/bind pattern for parameterized queries
+    const stmt = db.prepare(`SELECT * FROM audio_features WHERE id = ?`);
+    stmt.bind([spotifyId]);
 
-    if (result.length === 0 || result[0].values.length === 0) {
+    if (!stmt.step()) {
+      stmt.free();
       return null;
     }
 
+    // Get column names and values
+    const columns = stmt.getColumnNames();
+    const values = stmt.get();
+    stmt.free();
+
     // Map row to AudioFeatures interface
-    const columns = result[0].columns;
-    const values = result[0].values[0];
     const row: Record<string, unknown> = {};
     columns.forEach((col, i) => { row[col] = values[i]; });
 
@@ -437,20 +452,21 @@ async function batchFetchFromR2(
       const db = new SQL.Database(new Uint8Array(buffer));
 
       try {
+        // sql.js: use prepare/bind for parameterized queries
         const placeholders = ids.map(() => '?').join(',');
-        const result = db.exec(
-          `SELECT * FROM audio_features WHERE id IN (${placeholders})`,
-          ids
+        const stmt = db.prepare(
+          `SELECT * FROM audio_features WHERE id IN (${placeholders})`
         );
+        stmt.bind(ids);
 
-        if (result.length > 0) {
-          const columns = result[0].columns;
-          for (const values of result[0].values) {
-            const row: Record<string, unknown> = {};
-            columns.forEach((col, i) => { row[col] = values[i]; });
-            results.set(row.id as string, row as AudioFeatures);
-          }
+        const columns = stmt.getColumnNames();
+        while (stmt.step()) {
+          const values = stmt.get();
+          const row: Record<string, unknown> = {};
+          columns.forEach((col, i) => { row[col] = values[i]; });
+          results.set(row.id as string, row as AudioFeatures);
         }
+        stmt.free();
       } finally {
         db.close();
       }
@@ -736,18 +752,20 @@ class SpotifyMetadataCache {
     const db = new SQL.Database(new Uint8Array(buffer));
 
     try {
-      const result = db.exec(
-        `SELECT * FROM audio_features WHERE id = ?`,
-        [spotifyId]
-      );
+      // sql.js: use prepare/bind for parameterized queries
+      const stmt = db.prepare(`SELECT * FROM audio_features WHERE id = ?`);
+      stmt.bind([spotifyId]);
 
-      if (result.length === 0 || result[0].values.length === 0) {
+      if (!stmt.step()) {
+        stmt.free();
         return null;
       }
 
       // Map row to AudioFeatures interface
-      const columns = result[0].columns;
-      const values = result[0].values[0];
+      const columns = stmt.getColumnNames();
+      const values = stmt.get();
+      stmt.free();
+
       const row: Record<string, unknown> = {};
       columns.forEach((col, i) => { row[col] = values[i]; });
 
@@ -1136,7 +1154,9 @@ interface AudioFeatures {
   liveness: number;             // 0.0-1.0: Live audience presence
   valence: number;              // 0.0-1.0: Musical positiveness (happy vs sad)
   duration_ms?: number;         // Track duration in milliseconds
-  popularity?: number;          // 0-100 at time of snapshot
+  // NOTE: popularity comes from tracks table, not audio_features
+  // Must JOIN during import or fetch separately
+  popularity?: number;          // 0-100 at time of snapshot (from tracks table)
 }
 
 /**
@@ -1303,6 +1323,8 @@ CREATE TABLE albums (
 );
 
 -- Audio Features table (spotify_audio_features.db)
+-- NOTE: popularity is NOT in this table - it's in tracks table
+-- Must JOIN with tracks to get popularity for vector generation
 CREATE TABLE audio_features (
   id TEXT PRIMARY KEY,              -- Same as track ID
   danceability REAL,
@@ -1319,6 +1341,12 @@ CREATE TABLE audio_features (
   duration_ms INTEGER,
   time_signature INTEGER
 );
+
+-- To get audio features WITH popularity (for vectorization):
+-- SELECT af.*, t.popularity, t.name, t.artist_ids
+-- FROM audio_features af
+-- JOIN tracks t ON t.id = af.id
+-- WHERE t.popularity >= 30;
 
 -- Playlists table (spotify_playlists.db)
 CREATE TABLE playlists (
@@ -1358,7 +1386,21 @@ interface SpotifyAudioVector {
 }
 ```
 
-**Vector Dimensions (13 features, normalized):**
+**Vector Dimensions: 1536-dim Hybrid Vectors (RECOMMENDED)**
+
+Combine audio features with text embeddings for richer similarity matching:
+
+```
+┌────────────────────────────────────────────────────────────────┐
+│              1536-DIMENSION HYBRID VECTOR LAYOUT               │
+├────────────────────────────────────────────────────────────────┤
+│  Dims 0-12:   Normalized audio features (13 dims)              │
+│  Dims 13-1535: Text embedding of "{artist} - {title} [{genre}]"│
+│               (1523 dims from text-embedding-3-small)          │
+└────────────────────────────────────────────────────────────────┘
+```
+
+**Audio Feature Dimensions (0-12):**
 
 | Index | Feature | Normalization |
 |-------|---------|---------------|
@@ -1376,11 +1418,253 @@ interface SpotifyAudioVector {
 | 11 | time_signature | (time_sig - 3) / 4, clamped 0-1 |
 | 12 | popularity | popularity / 100 |
 
-**Alternative: Hybrid Vectors (1536 dimensions)**
+**Text Embedding Dimensions (13-1535):**
 
-Combine audio features with text embeddings:
-- Dimensions 0-12: Audio features (above)
-- Dimensions 13-1535: Text embedding of "{artist} - {title} [{genres}]"
+Generated using OpenAI's `text-embedding-3-small` (or compatible local model):
+- Input: `"{artist} - {title} [{primary_genre}]"`
+- Example: `"Radiohead - Paranoid Android [alternative rock]"`
+- Cost: ~$0.02 per 1M tokens (~$5 for full 256M tracks)
+
+**Why Hybrid?**
+- Audio features alone miss semantic relationships (covers, remixes, influences)
+- Text embeddings capture artist/genre clusters
+- Combined approach: "sounds like" + "vibes like"
+
+**Alternative: 13-dim Audio-Only Vectors**
+
+For lower cost/complexity, use only audio features. Reduces Vectorize storage but loses semantic matching.
+
+---
+
+## Helper Functions Reference
+
+Utility functions referenced throughout the spec. Implementations are straightforward but documented here for completeness.
+
+### sql.js Initialization
+
+```typescript
+import initSqlJsModule from 'sql.js';
+
+// Cache the SQL.js module to avoid re-initializing WASM
+let sqlPromise: Promise<SqlJsStatic> | null = null;
+
+/**
+ * Initialize sql.js with WASM.
+ * Caches the result for reuse within the same Worker invocation.
+ */
+async function initSqlJs(): Promise<SqlJsStatic> {
+  if (!sqlPromise) {
+    sqlPromise = initSqlJsModule({
+      // Load WASM from CDN or bundle it with the worker
+      locateFile: (file: string) => `https://sql.js.org/dist/${file}`
+    });
+  }
+  return sqlPromise;
+}
+```
+
+### Vector Math Utilities
+
+```typescript
+/**
+ * Compute cosine similarity between two vectors.
+ * Returns value between -1 and 1 (1 = identical direction).
+ */
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (a.length !== b.length) {
+    throw new Error(`Vector length mismatch: ${a.length} vs ${b.length}`);
+  }
+
+  let dotProduct = 0;
+  let normA = 0;
+  let normB = 0;
+
+  for (let i = 0; i < a.length; i++) {
+    dotProduct += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+
+  const denominator = Math.sqrt(normA) * Math.sqrt(normB);
+  return denominator === 0 ? 0 : dotProduct / denominator;
+}
+
+/**
+ * Normalize a value to 0-1 range given min/max bounds.
+ */
+function normalize(value: number, min: number, max: number): number {
+  return Math.max(0, Math.min(1, (value - min) / (max - min)));
+}
+
+/**
+ * Compute similarity between audio features and a genre profile.
+ * Only compares features present in the profile.
+ */
+function profileSimilarity(
+  features: AudioFeatures,
+  profile: Partial<AudioFeatures>
+): number {
+  const profileKeys = Object.keys(profile) as (keyof AudioFeatures)[];
+  if (profileKeys.length === 0) return 0;
+
+  let totalDiff = 0;
+  for (const key of profileKeys) {
+    const profileValue = profile[key] as number;
+    const featureValue = features[key] as number;
+    totalDiff += Math.abs(profileValue - featureValue);
+  }
+
+  // Convert average difference to similarity (0-1)
+  return 1 - (totalDiff / profileKeys.length);
+}
+```
+
+### Hybrid Vector Generation
+
+```typescript
+/**
+ * Generate a 1536-dim hybrid vector from audio features + text embedding.
+ */
+async function generateHybridVector(
+  features: AudioFeatures,
+  artistName: string,
+  trackTitle: string,
+  primaryGenre: string
+): Promise<number[]> {
+  // First 13 dimensions: normalized audio features
+  const audioVector = normalizeAudioFeatures(features);
+
+  // Remaining 1523 dimensions: text embedding
+  const textInput = `${artistName} - ${trackTitle} [${primaryGenre}]`;
+  const textEmbedding = await getTextEmbedding(textInput);
+
+  // Concatenate (audio features are already 0-1 scaled)
+  return [...audioVector, ...textEmbedding];
+}
+
+/**
+ * Get text embedding from OpenAI or compatible API.
+ * For batch import, use the batch API for cost savings.
+ */
+async function getTextEmbedding(text: string): Promise<number[]> {
+  // Implementation uses OpenAI text-embedding-3-small
+  // Returns 1536-dim vector, but we only use dims 13-1535 (1523 dims)
+  // after reserving 0-12 for audio features
+  const response = await fetch('https://api.openai.com/v1/embeddings', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${process.env.OPENAI_API_KEY}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({
+      model: 'text-embedding-3-small',
+      input: text,
+      dimensions: 1523  // Request exact size needed
+    })
+  });
+
+  const data = await response.json();
+  return data.data[0].embedding;
+}
+```
+
+### D1 Batch Utilities
+
+```typescript
+/**
+ * SQLite/D1 has a limit of ~999 bound parameters per query.
+ * Chunk large arrays for safe batch operations.
+ */
+const D1_PARAM_LIMIT = 900; // Leave some headroom
+
+/**
+ * Chunk an array into smaller arrays of max size.
+ */
+function chunkArray<T>(array: T[], maxSize: number): T[][] {
+  const chunks: T[][] = [];
+  for (let i = 0; i < array.length; i += maxSize) {
+    chunks.push(array.slice(i, i + maxSize));
+  }
+  return chunks;
+}
+
+/**
+ * Execute a batch update with automatic chunking.
+ * Handles D1's parameter limit by splitting into multiple queries.
+ */
+async function batchUpdate(
+  ids: string[],
+  updateFn: (chunk: string[]) => Promise<void>
+): Promise<void> {
+  const chunks = chunkArray(ids, D1_PARAM_LIMIT);
+
+  for (const chunk of chunks) {
+    await updateFn(chunk);
+  }
+}
+
+// Example usage in promoteTracksToVectorize:
+async function markAsVectorized(ids: string[]): Promise<void> {
+  await batchUpdate(ids, async (chunk) => {
+    const placeholders = chunk.map(() => '?').join(',');
+    await Resource.SpotifyCache.prepare(`
+      UPDATE track_access_log
+      SET vectorized = 1, promoted_at = unixepoch()
+      WHERE spotify_id IN (${placeholders})
+    `).bind(...chunk).run();
+  });
+}
+```
+
+### Vectorize Binding (Manual Setup Required)
+
+SST doesn't yet have native Vectorize support. Set up manually with wrangler:
+
+```bash
+# Create the Vectorize index (1536 dimensions for hybrid vectors)
+pnpm wrangler vectorize create grovemusic-spotify-tracks \
+  --dimensions=1536 \
+  --metric=cosine
+
+# Add binding to wrangler.toml (for the worker that needs it)
+# [[vectorize]]
+# binding = "SPOTIFY_VECTORS"
+# index_name = "grovemusic-spotify-tracks"
+```
+
+**Accessing Vectorize in Worker code:**
+
+```typescript
+// Since SST doesn't manage Vectorize, access via env parameter
+export interface Env {
+  SPOTIFY_VECTORS: VectorizeIndex;
+  // ... other SST-managed bindings via Resource.*
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Vectorize via env (not Resource)
+    const similar = await env.SPOTIFY_VECTORS.query(vector, {
+      topK: 50,
+      returnMetadata: true
+    });
+
+    // D1/KV/R2 via SST Resource
+    const cached = await Resource.SpotifyKV.get('key');
+
+    return new Response(JSON.stringify(similar));
+  }
+};
+```
+
+**Hybrid SST + wrangler.toml approach:**
+
+```toml
+# wrangler.toml (add to SST-generated config)
+[[vectorize]]
+binding = "SPOTIFY_VECTORS"
+index_name = "grovemusic-spotify-tracks"
+```
 
 ---
 
@@ -1842,7 +2126,18 @@ async function vectorizeAudioFeatures(config: ImportConfig): Promise<void> {
 | Co-occurrence mining | High | Very High | 48-72 hours |
 | Upload to Cloudflare | Low | Low | 4-8 hours |
 
-**Recommended:** Run on a dedicated machine with 32GB+ RAM, SSD storage
+**Import Machine:** M4 Mac mini (32GB RAM, SSD)
+
+| Phase | Estimated Time on M4 Mac mini |
+|-------|-------------------------------|
+| Download | 1-4 hours (bandwidth dependent) |
+| Decompress | 1-2 hours (fast SSD + unified memory) |
+| Cross-reference | 4-8 hours |
+| Vectorize (1536-dim) | 12-24 hours (text embeddings add time) |
+| Co-occurrence mining | 24-48 hours |
+| Upload to Cloudflare | 2-4 hours |
+
+**Note:** M4's unified memory architecture handles large SQLite files efficiently. Monitor Activity Monitor for memory pressure during co-occurrence mining.
 
 ---
 
@@ -1885,18 +2180,20 @@ async function getAudioFeatures(trackId: string): Promise<AudioFeatures | null> 
   const db = new SQL.Database(new Uint8Array(buffer));
 
   try {
-    const result = db.exec(
-      'SELECT * FROM audio_features WHERE id = ?',
-      [trackId]
-    );
+    // sql.js: use prepare/bind for parameterized queries
+    const stmt = db.prepare('SELECT * FROM audio_features WHERE id = ?');
+    stmt.bind([trackId]);
 
-    if (result.length === 0 || result[0].values.length === 0) {
+    if (!stmt.step()) {
+      stmt.free();
       return null;
     }
 
     // Map to AudioFeatures
-    const columns = result[0].columns;
-    const values = result[0].values[0];
+    const columns = stmt.getColumnNames();
+    const values = stmt.get();
+    stmt.free();
+
     const features: Record<string, unknown> = {};
     columns.forEach((col, i) => { features[col] = values[i]; });
 

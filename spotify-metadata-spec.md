@@ -429,16 +429,20 @@ class SpotifyMetadataCache {
     // Layer 4: R2 cold storage (skip Layer 3 for single lookups)
     const features = await this.fetchFromR2(spotifyId);
     if (features) {
-      // Track access for potential promotion
-      await this.recordAccess(spotifyId);
-
-      // Cache in D1 for repeated access
-      await this.cacheInD1(spotifyId, features);
-
-      // Cache in KV for edge access
-      await this.config.kv.put(kvKey, JSON.stringify(features), {
-        expirationTtl: CACHE_TTLS.audioFeatures
+      // FIRE-AND-FORGET: Track access for potential promotion
+      // Don't await - this is async background work, user shouldn't wait
+      this.recordAccess(spotifyId).catch(() => {
+        // Swallow errors - access logging is best-effort
+        // If it fails, track just won't be promoted as quickly
       });
+
+      // These we DO await - user needs cached result for next request
+      await Promise.all([
+        this.cacheInD1(spotifyId, features),
+        this.config.kv.put(kvKey, JSON.stringify(features), {
+          expirationTtl: CACHE_TTLS.audioFeatures
+        })
+      ]);
 
       this.requestCache.set(spotifyId, features);
     }
@@ -456,7 +460,8 @@ class SpotifyMetadataCache {
   }
 
   private async recordAccess(spotifyId: string): Promise<void> {
-    // Increment access counter for promotion decisions
+    // Increment access counter for background promotion job
+    // This is called fire-and-forget from the hot path
     await this.config.d1.prepare(`
       INSERT INTO track_access_log (spotify_id, access_count, last_accessed)
       VALUES (?, 1, unixepoch())
@@ -470,7 +475,33 @@ class SpotifyMetadataCache {
 
 ### Dynamic Vector Promotion
 
-Tracks that are queried frequently but not yet in Vectorize can be promoted:
+Tracks that are queried frequently but not yet in Vectorize are promoted **asynchronously via background jobs** — never during user requests.
+
+#### Why Async Promotion?
+
+Vectorization during a user request would add 200-500ms latency. Instead:
+
+```
+USER REQUEST (synchronous)          BACKGROUND JOB (async)
+────────────────────────────        ────────────────────────
+1. Query obscure track              Runs every 24h via Cron:
+2. Cache miss → fetch R2            1. Find tracks with 3+ queries
+3. Record access (fire-and-forget)  2. Batch vectorize ~1000 tracks
+4. Return to user immediately       3. Upsert to Vectorize
+   └── No waiting for vectorization    └── No user waiting
+```
+
+#### User Experience Timeline
+
+| Query # | What Happens | User Latency |
+|---------|--------------|--------------|
+| 1st query | R2 fetch, access logged | ~500ms |
+| 2nd query | KV cache hit | ~50ms |
+| 3rd query | KV cache hit, access_count=3 | ~50ms |
+| *overnight* | Background job promotes to Vectorize | — |
+| Future queries | Now in Vectorize for KNN search | ~200ms |
+
+#### Promotion Configuration
 
 ```typescript
 interface PromotionConfig {
@@ -524,6 +555,55 @@ async function promoteTracksToVectorize(
 
   return vectors.length;
 }
+```
+
+#### Cron Trigger Setup
+
+Configure in `wrangler.toml` to run the promotion job automatically:
+
+```toml
+# wrangler.toml
+
+[triggers]
+crons = ["0 3 * * *"]  # Run at 3 AM UTC daily
+
+[[d1_databases]]
+binding = "DB"
+database_name = "grovemusic"
+database_id = "..."
+```
+
+```typescript
+// src/index.ts - Cron handler
+
+export default {
+  async scheduled(
+    controller: ScheduledController,
+    env: Env,
+    ctx: ExecutionContext
+  ): Promise<void> {
+    const config: PromotionConfig = {
+      accessThreshold: 3,
+      batchSize: 1000,
+      maxVectors: 20_000_000,
+      checkIntervalHours: 24
+    };
+
+    const cache = new SpotifyMetadataCache({
+      kv: env.KV,
+      d1: env.DB,
+      r2: env.R2,
+      vectorize: env.VECTORIZE
+    });
+
+    const promoted = await promoteTracksToVectorize(config, cache);
+    console.log(`Cron: Promoted ${promoted} tracks to Vectorize`);
+  },
+
+  async fetch(request: Request, env: Env): Promise<Response> {
+    // Normal request handling...
+  }
+};
 ```
 
 ### Precomputed Similarity Cache

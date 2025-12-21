@@ -1,7 +1,7 @@
 # Spotify Metadata Integration Specification
 
-**Version:** 1.0.0
-**Last Updated:** December 2025
+**Version:** 1.1.0
+**Last Updated:** December 21, 2025
 **Status:** Research/Planning
 **Parent Spec:** grovemusic-spec.md
 **Data Source:** Anna's Archive Spotify Backup (December 2025)
@@ -28,16 +28,18 @@ This specification details how Aria can leverage the Anna's Archive Spotify meta
 
 1. [Data Source Overview](#data-source-overview)
 2. [Dataset Inventory](#dataset-inventory)
-3. [Storage Architecture](#storage-architecture)
-4. [Schema Design](#schema-design)
-5. [Cross-Reference Strategy](#cross-reference-strategy)
-6. [Pipeline Integration](#pipeline-integration)
-7. [Audio Features Deep Dive](#audio-features-deep-dive)
-8. [Playlist Co-occurrence Mining](#playlist-co-occurrence-mining)
-9. [Import Pipeline](#import-pipeline)
-10. [Operational Considerations](#operational-considerations)
-11. [Legal & Ethical Notes](#legal--ethical-notes)
-12. [Implementation Phases](#implementation-phases)
+3. [Cost Analysis & Optimization](#cost-analysis--optimization)
+4. [Storage Architecture](#storage-architecture)
+5. [Caching Strategy](#caching-strategy)
+6. [Schema Design](#schema-design)
+7. [Cross-Reference Strategy](#cross-reference-strategy)
+8. [Pipeline Integration](#pipeline-integration)
+9. [Audio Features Deep Dive](#audio-features-deep-dive)
+10. [Playlist Co-occurrence Mining](#playlist-co-occurrence-mining)
+11. [Import Pipeline](#import-pipeline)
+12. [Operational Considerations](#operational-considerations)
+13. [Legal & Ethical Notes](#legal--ethical-notes)
+14. [Implementation Phases](#implementation-phases)
 
 ---
 
@@ -86,6 +88,159 @@ Data is distributed exclusively via BitTorrent through Anna's Archive torrents p
 
 ---
 
+## Cost Analysis & Optimization
+
+### Cloudflare Pricing Breakdown (December 2025)
+
+Understanding costs upfront ensures we architect for sustainability.
+
+#### R2 Object Storage
+
+| Resource | Free Tier | Paid Rate |
+|----------|-----------|-----------|
+| Storage | 10 GB/month | $0.015/GB/month |
+| Class A ops (writes) | 1M/month | $4.50/million |
+| Class B ops (reads) | 10M/month | $0.36/million |
+
+**For 200GB metadata storage:**
+```
+Storage:    (200GB - 10GB free) × $0.015 = $2.85/month
+Operations: ~5M reads/month × $0.36/M   = $1.80/month
+────────────────────────────────────────────────────────
+R2 Total:                                 ~$5/month
+```
+
+#### D1 Database
+
+| Resource | Free Tier | Paid Rate |
+|----------|-----------|-----------|
+| Storage | 5 GB | $0.75/GB/month |
+| Rows read | 25B/month | $0.001/million |
+| Rows written | 50M/month | $1.00/million |
+
+**For hot cache (staying within free tier):**
+```
+Storage:    5GB (free tier)              = $0/month
+Operations: Within free tier             = $0/month
+────────────────────────────────────────────────────────
+D1 Total:                                 $0/month
+```
+
+#### Vectorize (The Critical Decision)
+
+| Resource | Free Tier | Paid Rate |
+|----------|-----------|-----------|
+| Stored vectors | 200K | $0.05/million vectors/month |
+| Dimensions | 1536 max | included |
+| Queries | 30M/month | $0.01/1K queries |
+
+**Full dataset approach (NOT recommended):**
+```
+256M vectors × $0.05/million = $12.80/month
+```
+
+**Popularity-tiered approach (RECOMMENDED):**
+
+| Popularity Threshold | Tracks Included | Monthly Cost |
+|---------------------|-----------------|--------------|
+| All tracks (≥0) | 256M | $12.80 |
+| Popularity ≥ 10 | ~50M | $2.50 |
+| Popularity ≥ 20 | ~30M | $1.50 |
+| Popularity ≥ 30 | ~15M | $0.75 |
+| Popularity ≥ 40 | ~10M | $0.50 |
+| Top 5M only | 5M | $0.25 |
+
+**Insight:** Tracks with popularity < 20 account for ~85% of the catalog but represent < 5% of user queries. Vectorize the popular subset; fetch obscure tracks on-demand from R2.
+
+#### KV Storage (for edge caching)
+
+| Resource | Free Tier | Paid Rate |
+|----------|-----------|-----------|
+| Storage | 1 GB | $0.50/GB/month |
+| Reads | 10M/day | $0.50/million |
+| Writes | 1M/day | $5.00/million |
+
+**For edge cache layer:**
+```
+Storage:    1GB (free tier)              = $0/month
+Operations: Within free tier             = $0/month
+────────────────────────────────────────────────────────
+KV Total:                                 $0/month
+```
+
+### Cost Optimization Strategies
+
+#### Strategy 1: Tiered Vectorization (Primary Savings)
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                    TIERED VECTORIZATION STRATEGY                         │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Tier A: Pre-vectorized (Vectorize)          ~15M tracks        │    │
+│  │  ─────────────────────────────────────────────────────────────  │    │
+│  │  • Popularity ≥ 30                                               │    │
+│  │  • Instant similarity search                                     │    │
+│  │  • Cost: ~$0.75/month                                           │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              ↓ cache miss                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Tier B: On-demand vectorization             ~35M tracks        │    │
+│  │  ─────────────────────────────────────────────────────────────  │    │
+│  │  • Popularity 10-29                                              │    │
+│  │  • Fetch from R2 → compute vector → cache in D1                 │    │
+│  │  • Add to Vectorize if queried 3+ times                         │    │
+│  │  • Cost: R2 read costs only                                     │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                              ↓ cache miss                               │
+│  ┌─────────────────────────────────────────────────────────────────┐    │
+│  │  Tier C: Cold storage only                   ~206M tracks       │    │
+│  │  ─────────────────────────────────────────────────────────────  │    │
+│  │  • Popularity < 10                                               │    │
+│  │  • Fetch from R2 on-demand                                       │    │
+│  │  • Compute similarity locally (no Vectorize)                    │    │
+│  │  • Cost: Minimal R2 reads                                       │    │
+│  └─────────────────────────────────────────────────────────────────┘    │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+#### Strategy 2: Aggressive KV Caching
+
+Cache frequently accessed data at the edge to reduce D1/R2 operations:
+
+| Data Type | Cache Location | TTL | Estimated Hit Rate |
+|-----------|---------------|-----|-------------------|
+| Audio features (popular tracks) | KV | 7 days | 80%+ |
+| Cross-reference lookups | KV | 30 days | 90%+ |
+| Co-occurrence scores | KV | 7 days | 70%+ |
+| Recent similarity results | KV | 1 hour | 40%+ |
+
+#### Strategy 3: Precomputed Results
+
+Precompute and store common operations:
+
+| Precomputation | Storage | Benefit |
+|----------------|---------|---------|
+| Top 100 similar tracks per popular track | D1 | Skip Vectorize query |
+| Genre cluster assignments | D1 | Fast genre filtering |
+| Decade buckets | D1 | Fast temporal filtering |
+| Artist similarity matrix (top 100K artists) | R2 | Skip repeated computation |
+
+### Monthly Cost Summary
+
+| Deployment | R2 | D1 | Vectorize | KV | Total |
+|------------|----|----|-----------|----|----|
+| **Lean** (10M vectors) | $5 | $0 | $0.50 | $0 | **~$6/month** |
+| **Balanced** (15M vectors) | $5 | $0 | $0.75 | $0 | **~$6/month** |
+| **Standard** (30M vectors) | $5 | $0 | $1.50 | $0 | **~$7/month** |
+| **Full** (256M vectors) | $5 | $0 | $12.80 | $0 | **~$18/month** |
+
+**Recommendation:** Start with **Balanced** (~$6/month), monitor query patterns, and promote frequently-accessed tracks to Vectorize dynamically.
+
+---
+
 ## Storage Architecture
 
 ### Tiered Storage Strategy
@@ -113,7 +268,7 @@ Data is distributed exclusively via BitTorrent through Anna's Archive torrents p
 │  ───────────────────────────────────────────                            │
 │  • Audio feature embeddings (normalized)                                 │
 │  • Hybrid embeddings (audio + text features)                            │
-│  • Size: ~256M vectors × dimensions                                     │
+│  • Size: ~15M vectors (popularity ≥ 30) — see Cost Analysis            │
 │                                                                          │
 │  Tier 4: Cold Storage (Cloudflare R2 Archive)                           │
 │  ────────────────────────────────────────────                           │
@@ -124,16 +279,328 @@ Data is distributed exclusively via BitTorrent through Anna's Archive torrents p
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Cloudflare Resource Estimates
+### Resource Summary
 
-| Resource | Usage | Monthly Cost Estimate |
-|----------|-------|----------------------|
-| D1 Storage | 10GB | ~$0.75 |
-| D1 Reads | 10M/month | ~$0.50 |
-| R2 Storage | 250GB | ~$3.75 |
-| R2 Operations | 5M/month | ~$2.00 |
-| Vectorize | 256M vectors | TBD (beta pricing) |
-| **Total** | | ~$10-20/month |
+See [Cost Analysis & Optimization](#cost-analysis--optimization) for detailed pricing breakdown.
+
+| Resource | Recommended Config | Monthly Cost |
+|----------|-------------------|--------------|
+| R2 Storage | 200GB metadata databases | ~$5 |
+| D1 | 5GB hot cache (free tier) | $0 |
+| Vectorize | 15M popular tracks | ~$0.75 |
+| KV | Edge cache (free tier) | $0 |
+| **Total** | | **~$6/month** |
+
+---
+
+## Caching Strategy
+
+Aggressive caching is critical for cost optimization and performance. Every cache hit saves an R2 read, D1 query, or Vectorize lookup.
+
+### Cache Hierarchy
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        5-LAYER CACHE HIERARCHY                           │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                          │
+│  Layer 0: Request-level (in-memory)                        TTL: request │
+│  ───────────────────────────────────────────────────────────────────── │
+│  • Deduplication within single pipeline run                             │
+│  • Map<string, AudioFeatures> in Worker memory                          │
+│  • Zero cost, instant access                                            │
+│                                                                          │
+│  Layer 1: Edge Cache (Cloudflare KV)                      TTL: 1-30 days│
+│  ───────────────────────────────────────────────────────────────────── │
+│  • Globally distributed, ~50ms latency                                  │
+│  • Audio features for frequently queried tracks                         │
+│  • Cross-reference lookups (Spotify ID ↔ MBID)                         │
+│  • Similarity results for popular seed tracks                           │
+│  • Free tier: 1GB storage, 10M reads/day                               │
+│                                                                          │
+│  Layer 2: Hot Database (Cloudflare D1)                    TTL: permanent│
+│  ───────────────────────────────────────────────────────────────────── │
+│  • SQL-queryable structured cache                                        │
+│  • Precomputed similarity scores                                        │
+│  • Cross-reference tables                                                │
+│  • Promotion candidates (tracks queried 3+ times)                       │
+│  • Free tier: 5GB, 25B reads/month                                      │
+│                                                                          │
+│  Layer 3: Vector Index (Cloudflare Vectorize)             TTL: permanent│
+│  ───────────────────────────────────────────────────────────────────── │
+│  • KNN similarity search for popular tracks                             │
+│  • Only tracks with popularity ≥ 30 pre-indexed                        │
+│  • Dynamic promotion based on query frequency                           │
+│  • ~15M vectors = ~$0.75/month                                          │
+│                                                                          │
+│  Layer 4: Cold Storage (Cloudflare R2)                    TTL: permanent│
+│  ───────────────────────────────────────────────────────────────────── │
+│  • Complete SQLite databases                                             │
+│  • All 256M tracks available on-demand                                  │
+│  • Query via sql.js in Worker                                           │
+│  • ~$5/month for 200GB                                                  │
+│                                                                          │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### Cache Key Patterns
+
+```typescript
+// KV cache key patterns
+const CACHE_KEYS = {
+  // Audio features: spotify:af:{trackId}
+  audioFeatures: (spotifyId: string) => `spotify:af:${spotifyId}`,
+
+  // Cross-reference: spotify:xref:{spotifyId}
+  crossRef: (spotifyId: string) => `spotify:xref:${spotifyId}`,
+
+  // ISRC to Spotify: spotify:isrc:{isrc}
+  isrcLookup: (isrc: string) => `spotify:isrc:${isrc}`,
+
+  // Similarity results: spotify:sim:{seedId}:{limit}
+  similarityResults: (seedId: string, limit: number) =>
+    `spotify:sim:${seedId}:${limit}`,
+
+  // Co-occurrence: spotify:cooc:{trackA}:{trackB}
+  cooccurrence: (trackA: string, trackB: string) => {
+    const [a, b] = [trackA, trackB].sort();
+    return `spotify:cooc:${a}:${b}`;
+  },
+
+  // Precomputed top similar: spotify:topsim:{trackId}
+  topSimilar: (trackId: string) => `spotify:topsim:${trackId}`,
+};
+
+// TTL configuration (in seconds)
+const CACHE_TTLS = {
+  audioFeatures: 7 * 24 * 60 * 60,      // 7 days
+  crossRef: 30 * 24 * 60 * 60,           // 30 days (rarely changes)
+  isrcLookup: 30 * 24 * 60 * 60,         // 30 days
+  similarityResults: 1 * 60 * 60,        // 1 hour (personalized)
+  cooccurrence: 7 * 24 * 60 * 60,        // 7 days
+  topSimilar: 7 * 24 * 60 * 60,          // 7 days
+};
+```
+
+### Cache-Through Implementation
+
+```typescript
+interface CacheConfig {
+  kv: KVNamespace;
+  d1: D1Database;
+  r2: R2Bucket;
+  vectorize: VectorizeIndex;
+}
+
+class SpotifyMetadataCache {
+  private requestCache = new Map<string, AudioFeatures>();
+
+  constructor(private config: CacheConfig) {}
+
+  async getAudioFeatures(spotifyId: string): Promise<AudioFeatures | null> {
+    // Layer 0: Request-level cache
+    if (this.requestCache.has(spotifyId)) {
+      return this.requestCache.get(spotifyId)!;
+    }
+
+    // Layer 1: KV edge cache
+    const kvKey = CACHE_KEYS.audioFeatures(spotifyId);
+    const kvResult = await this.config.kv.get(kvKey, 'json');
+    if (kvResult) {
+      this.requestCache.set(spotifyId, kvResult as AudioFeatures);
+      return kvResult as AudioFeatures;
+    }
+
+    // Layer 2: D1 hot cache
+    const d1Result = await this.config.d1.prepare(`
+      SELECT * FROM spotify_audio_features_cache WHERE spotify_id = ?
+    `).bind(spotifyId).first();
+
+    if (d1Result) {
+      const features = d1Result as AudioFeatures;
+      // Promote to KV for faster future access
+      await this.config.kv.put(kvKey, JSON.stringify(features), {
+        expirationTtl: CACHE_TTLS.audioFeatures
+      });
+      this.requestCache.set(spotifyId, features);
+      return features;
+    }
+
+    // Layer 4: R2 cold storage (skip Layer 3 for single lookups)
+    const features = await this.fetchFromR2(spotifyId);
+    if (features) {
+      // Track access for potential promotion
+      await this.recordAccess(spotifyId);
+
+      // Cache in D1 for repeated access
+      await this.cacheInD1(spotifyId, features);
+
+      // Cache in KV for edge access
+      await this.config.kv.put(kvKey, JSON.stringify(features), {
+        expirationTtl: CACHE_TTLS.audioFeatures
+      });
+
+      this.requestCache.set(spotifyId, features);
+    }
+
+    return features;
+  }
+
+  private async fetchFromR2(spotifyId: string): Promise<AudioFeatures | null> {
+    // Fetch SQLite database chunk and query
+    // Implementation uses sql.js or similar
+    const db = await this.getR2Database('spotify_audio_features.db');
+    return db.prepare('SELECT * FROM audio_features WHERE id = ?')
+      .bind(spotifyId)
+      .first() as AudioFeatures | null;
+  }
+
+  private async recordAccess(spotifyId: string): Promise<void> {
+    // Increment access counter for promotion decisions
+    await this.config.d1.prepare(`
+      INSERT INTO track_access_log (spotify_id, access_count, last_accessed)
+      VALUES (?, 1, unixepoch())
+      ON CONFLICT(spotify_id) DO UPDATE SET
+        access_count = access_count + 1,
+        last_accessed = unixepoch()
+    `).bind(spotifyId).run();
+  }
+}
+```
+
+### Dynamic Vector Promotion
+
+Tracks that are queried frequently but not yet in Vectorize can be promoted:
+
+```typescript
+interface PromotionConfig {
+  accessThreshold: number;      // Queries before promotion (default: 3)
+  batchSize: number;            // Tracks to promote per run (default: 1000)
+  maxVectors: number;           // Cap on Vectorize size (default: 20M)
+  checkIntervalHours: number;   // How often to run promotion (default: 24)
+}
+
+async function promoteTracksToVectorize(
+  config: PromotionConfig,
+  cache: SpotifyMetadataCache
+): Promise<number> {
+  // Find tracks with high access counts not yet in Vectorize
+  const candidates = await cache.d1.prepare(`
+    SELECT
+      tal.spotify_id,
+      tal.access_count,
+      saf.tempo, saf.energy, saf.danceability, saf.valence,
+      saf.acousticness, saf.instrumentalness, saf.speechiness,
+      saf.liveness, saf.loudness, saf.key, saf.mode, saf.time_signature,
+      saf.popularity
+    FROM track_access_log tal
+    JOIN spotify_audio_features_cache saf ON saf.spotify_id = tal.spotify_id
+    WHERE tal.access_count >= ?
+      AND tal.vectorized = 0
+    ORDER BY tal.access_count DESC
+    LIMIT ?
+  `).bind(config.accessThreshold, config.batchSize).all();
+
+  if (candidates.results.length === 0) return 0;
+
+  // Generate vectors and upsert to Vectorize
+  const vectors = candidates.results.map(row => ({
+    id: row.spotify_id as string,
+    values: normalizeAudioFeatures(row as AudioFeatures),
+    metadata: {
+      popularity: row.popularity as number,
+      promoted: true,
+      promotedAt: Date.now()
+    }
+  }));
+
+  await cache.vectorize.upsert(vectors);
+
+  // Mark as vectorized
+  const ids = candidates.results.map(r => r.spotify_id);
+  await cache.d1.prepare(`
+    UPDATE track_access_log SET vectorized = 1 WHERE spotify_id IN (${ids.map(() => '?').join(',')})
+  `).bind(...ids).run();
+
+  return vectors.length;
+}
+```
+
+### Precomputed Similarity Cache
+
+For the most popular tracks, precompute and cache similarity results:
+
+```typescript
+// Precompute top 100 similar tracks for top 100K popular tracks
+async function precomputeTopSimilar(
+  cache: SpotifyMetadataCache,
+  vectorize: VectorizeIndex
+): Promise<void> {
+  const POPULAR_TRACK_LIMIT = 100_000;
+  const SIMILAR_PER_TRACK = 100;
+
+  // Get most popular tracks
+  const popularTracks = await cache.d1.prepare(`
+    SELECT spotify_id, popularity
+    FROM spotify_audio_features_cache
+    ORDER BY popularity DESC
+    LIMIT ?
+  `).bind(POPULAR_TRACK_LIMIT).all();
+
+  for (const track of popularTracks.results) {
+    const spotifyId = track.spotify_id as string;
+
+    // Check if already computed
+    const existing = await cache.kv.get(CACHE_KEYS.topSimilar(spotifyId));
+    if (existing) continue;
+
+    // Get audio features and find similar
+    const features = await cache.getAudioFeatures(spotifyId);
+    if (!features) continue;
+
+    const vector = normalizeAudioFeatures(features);
+    const similar = await vectorize.query(vector, {
+      topK: SIMILAR_PER_TRACK,
+      returnMetadata: true
+    });
+
+    // Cache the results
+    await cache.kv.put(
+      CACHE_KEYS.topSimilar(spotifyId),
+      JSON.stringify(similar.matches),
+      { expirationTtl: CACHE_TTLS.topSimilar }
+    );
+  }
+}
+```
+
+### Cache Metrics
+
+Track cache performance to optimize TTLs and promotion thresholds:
+
+```typescript
+interface CacheMetrics {
+  layer: 'request' | 'kv' | 'd1' | 'vectorize' | 'r2';
+  operation: 'hit' | 'miss';
+  latencyMs: number;
+  dataType: 'audioFeatures' | 'crossRef' | 'similarity' | 'cooccurrence';
+}
+
+async function recordCacheMetric(metric: CacheMetrics): Promise<void> {
+  // Log to Analytics Engine or similar
+  console.log(JSON.stringify({
+    type: 'cache_metric',
+    ...metric,
+    timestamp: Date.now()
+  }));
+}
+
+// Target metrics:
+// - KV hit rate: > 80% for audio features
+// - D1 hit rate: > 60% for cross-references
+// - Vectorize coverage: > 95% of seed track queries
+// - R2 fallback rate: < 5% of total queries
+```
 
 ---
 
@@ -197,6 +664,28 @@ CREATE TABLE spotify_artist_genres (
 );
 
 CREATE INDEX idx_genre ON spotify_artist_genres(genre);
+
+-- Track access logging for dynamic promotion
+CREATE TABLE track_access_log (
+  spotify_id TEXT PRIMARY KEY,
+  access_count INTEGER DEFAULT 1,
+  last_accessed INTEGER,           -- Unix timestamp
+  vectorized INTEGER DEFAULT 0,    -- 1 if promoted to Vectorize
+  promoted_at INTEGER              -- When promoted to Vectorize
+);
+
+CREATE INDEX idx_access_promotion ON track_access_log(access_count, vectorized);
+
+-- Precomputed similarity cache (skip Vectorize for popular pairs)
+CREATE TABLE precomputed_similar (
+  seed_spotify_id TEXT NOT NULL,
+  similar_spotify_id TEXT NOT NULL,
+  similarity_score REAL,
+  rank INTEGER,                    -- 1 = most similar
+  PRIMARY KEY (seed_spotify_id, similar_spotify_id)
+);
+
+CREATE INDEX idx_precomputed_seed ON precomputed_similar(seed_spotify_id, rank);
 ```
 
 ### R2 SQLite Schema (Imported from Source)

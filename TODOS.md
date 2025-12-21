@@ -45,6 +45,59 @@
 
 ---
 
+## Spotify Metadata Integration (Post-MVP)
+
+### Phase S0: Research & Acquisition
+- [ ] Download metadata torrents from Anna's Archive
+- [ ] Verify data integrity with provided checksums
+- [ ] Document exact file inventory and sizes
+- [ ] Set up local environment with SQLite tools
+- [ ] Explore database schemas and sample data
+
+### Phase S1: Storage Setup
+- [ ] Create R2 bucket for partitioned SQLite databases
+- [ ] Create D1 tables for hot data and cross-references
+- [ ] Create Vectorize index for audio features (15M vectors)
+- [ ] Partition source databases by Spotify ID prefix (3,844 partitions)
+- [ ] Upload partitions to R2
+
+### Phase S2: Cross-Reference Building
+- [ ] Download MusicBrainz ISRC dump (or use API)
+- [ ] Build ISRC → MBID lookup table
+- [ ] Run cross-reference matching pipeline
+- [ ] Analyze match rates and quality
+- [ ] Store results in D1
+
+### Phase S3: Audio Feature Integration
+- [ ] Implement audio feature normalization (13-dim or 1536-dim hybrid)
+- [ ] Generate vectors for popular tracks (popularity ≥ 30)
+- [ ] Upload to Vectorize in batches
+- [ ] Implement similarity query functions
+- [ ] Integrate into candidate generation pipeline
+
+### Phase S4: Playlist Mining
+- [ ] Implement co-occurrence mining algorithm
+- [ ] Run on playlist dataset (48-72 hours estimated)
+- [ ] Store significant pairs in D1 (PMI + Jaccard scores)
+- [ ] Implement co-occurrence score function
+- [ ] Integrate into similarity scoring
+
+### Phase S5: Pipeline Integration
+- [ ] Update Track Enricher to fetch Spotify features
+- [ ] Update Candidate Generator with new sources
+- [ ] Update Similarity Scorer with new dimensions (audio: 25%, cooccurrence: 25%)
+- [ ] Adjust scoring weights based on testing
+- [ ] A/B test old vs new pipeline
+
+### Phase S6: Optimization & Launch
+- [ ] Implement dynamic vector promotion (3+ queries → Vectorize)
+- [ ] Set up cron job for background promotion
+- [ ] Monitor performance and costs (~$6/month target)
+- [ ] Document operational procedures
+- [ ] Deploy to production
+
+---
+
 ## Immediate Next Steps
 1. ~~Run `pnpm install` to install dependencies~~ ✅
 2. ~~Set up Cloudflare resources (D1, KV, R2, Vectorize)~~ ✅
@@ -65,3 +118,4 @@
 ---
 
 *See `grovemusic-spec.md` for full specification*
+*See `spotify-metadata-spec.md` for Spotify integration details*

@@ -384,18 +384,13 @@ const CACHE_TTLS = {
 
 ### Cache-Through Implementation
 
+Using SST's Resource SDK for type-safe access to linked resources:
+
 ```typescript
-interface CacheConfig {
-  kv: KVNamespace;
-  d1: D1Database;
-  r2: R2Bucket;
-  vectorize: VectorizeIndex;
-}
+import { Resource } from "sst";
 
 class SpotifyMetadataCache {
   private requestCache = new Map<string, AudioFeatures>();
-
-  constructor(private config: CacheConfig) {}
 
   async getAudioFeatures(spotifyId: string): Promise<AudioFeatures | null> {
     // Layer 0: Request-level cache
@@ -403,23 +398,23 @@ class SpotifyMetadataCache {
       return this.requestCache.get(spotifyId)!;
     }
 
-    // Layer 1: KV edge cache
+    // Layer 1: KV edge cache (via SST Resource)
     const kvKey = CACHE_KEYS.audioFeatures(spotifyId);
-    const kvResult = await this.config.kv.get(kvKey, 'json');
+    const kvResult = await Resource.SpotifyKV.get(kvKey, { type: "json" });
     if (kvResult) {
       this.requestCache.set(spotifyId, kvResult as AudioFeatures);
       return kvResult as AudioFeatures;
     }
 
-    // Layer 2: D1 hot cache
-    const d1Result = await this.config.d1.prepare(`
+    // Layer 2: D1 hot cache (via SST Resource)
+    const d1Result = await Resource.SpotifyCache.prepare(`
       SELECT * FROM spotify_audio_features_cache WHERE spotify_id = ?
     `).bind(spotifyId).first();
 
     if (d1Result) {
       const features = d1Result as AudioFeatures;
       // Promote to KV for faster future access
-      await this.config.kv.put(kvKey, JSON.stringify(features), {
+      await Resource.SpotifyKV.put(kvKey, JSON.stringify(features), {
         expirationTtl: CACHE_TTLS.audioFeatures
       });
       this.requestCache.set(spotifyId, features);
@@ -439,7 +434,7 @@ class SpotifyMetadataCache {
       // These we DO await - user needs cached result for next request
       await Promise.all([
         this.cacheInD1(spotifyId, features),
-        this.config.kv.put(kvKey, JSON.stringify(features), {
+        Resource.SpotifyKV.put(kvKey, JSON.stringify(features), {
           expirationTtl: CACHE_TTLS.audioFeatures
         })
       ]);
@@ -451,18 +446,53 @@ class SpotifyMetadataCache {
   }
 
   private async fetchFromR2(spotifyId: string): Promise<AudioFeatures | null> {
-    // Fetch SQLite database chunk and query
-    // Implementation uses sql.js or similar
-    const db = await this.getR2Database('spotify_audio_features.db');
-    return db.prepare('SELECT * FROM audio_features WHERE id = ?')
-      .bind(spotifyId)
-      .first() as AudioFeatures | null;
+    // Fetch SQLite database from R2 and query with sql.js
+    const dbFile = await Resource.SpotifyStorage.get("spotify_audio_features.db");
+    if (!dbFile) return null;
+
+    // Load with sql.js (WASM SQLite)
+    const SQL = await initSqlJs();
+    const buffer = await dbFile.arrayBuffer();
+    const db = new SQL.Database(new Uint8Array(buffer));
+
+    const result = db.exec(
+      `SELECT * FROM audio_features WHERE id = ?`,
+      [spotifyId]
+    );
+
+    db.close();
+    return result[0]?.values[0] as AudioFeatures | null;
+  }
+
+  private async cacheInD1(spotifyId: string, features: AudioFeatures): Promise<void> {
+    await Resource.SpotifyCache.prepare(`
+      INSERT OR REPLACE INTO spotify_audio_features_cache
+      (spotify_id, tempo, energy, danceability, valence, acousticness,
+       instrumentalness, speechiness, liveness, loudness, key, mode,
+       time_signature, popularity, cached_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch())
+    `).bind(
+      spotifyId,
+      features.tempo,
+      features.energy,
+      features.danceability,
+      features.valence,
+      features.acousticness,
+      features.instrumentalness,
+      features.speechiness,
+      features.liveness,
+      features.loudness,
+      features.key,
+      features.mode,
+      features.time_signature,
+      features.popularity
+    ).run();
   }
 
   private async recordAccess(spotifyId: string): Promise<void> {
     // Increment access counter for background promotion job
     // This is called fire-and-forget from the hot path
-    await this.config.d1.prepare(`
+    await Resource.SpotifyCache.prepare(`
       INSERT INTO track_access_log (spotify_id, access_count, last_accessed)
       VALUES (?, 1, unixepoch())
       ON CONFLICT(spotify_id) DO UPDATE SET
@@ -557,54 +587,151 @@ async function promoteTracksToVectorize(
 }
 ```
 
-#### Cron Trigger Setup
+#### SST Infrastructure Configuration
 
-Configure in `wrangler.toml` to run the promotion job automatically:
+This project uses [SST](https://sst.dev) for infrastructure-as-code with TypeScript instead of raw `wrangler.toml`. SST provides type-safe resource definitions, automatic linking, and a cleaner developer experience.
 
-```toml
-# wrangler.toml
-
-[triggers]
-crons = ["0 3 * * *"]  # Run at 3 AM UTC daily
-
-[[d1_databases]]
-binding = "DB"
-database_name = "grovemusic"
-database_id = "..."
+**Install SST:**
+```bash
+pnpm add -D sst
 ```
 
+**Define resources in `sst.config.ts`:**
+
 ```typescript
-// src/index.ts - Cron handler
+/// <reference path="./.sst/platform/config.d.ts" />
+
+export default $config({
+  app(input) {
+    return {
+      name: "grovemusic",
+      removal: input?.stage === "production" ? "retain" : "remove",
+      home: "cloudflare",
+    };
+  },
+  async run() {
+    // ─────────────────────────────────────────────────────────────────────
+    // Spotify Metadata Resources
+    // ─────────────────────────────────────────────────────────────────────
+
+    // D1 Database for hot cache and cross-references
+    const db = new sst.cloudflare.D1("SpotifyCache");
+
+    // KV for edge caching (audio features, similarity results)
+    const kv = new sst.cloudflare.Kv("SpotifyKV");
+
+    // R2 for cold storage (200GB SQLite databases)
+    const storage = new sst.cloudflare.Bucket("SpotifyStorage");
+
+    // Vectorize index for audio feature similarity search
+    // Note: Vectorize may need manual setup via wrangler until SST adds support
+    // pnpm wrangler vectorize create grovemusic-spotify-tracks --dimensions=13 --metric=cosine
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Workers
+    // ─────────────────────────────────────────────────────────────────────
+
+    // Main API worker
+    const api = new sst.cloudflare.Worker("SpotifyMetadataAPI", {
+      handler: "./workers/spotify-metadata/src/index.ts",
+      link: [db, kv, storage],
+      url: true,
+    });
+
+    // Cron worker for background promotion
+    const promotionCron = new sst.cloudflare.Cron("SpotifyPromotionCron", {
+      job: {
+        handler: "./workers/spotify-promotion/src/index.ts",
+        link: [db, kv, storage],
+      },
+      schedules: ["0 3 * * *"], // 3 AM UTC daily
+    });
+
+    return {
+      api: api.url,
+    };
+  },
+});
+```
+
+**Worker code using SST's Resource SDK:**
+
+```typescript
+// workers/spotify-metadata/src/index.ts
+import { Resource } from "sst";
 
 export default {
-  async scheduled(
-    controller: ScheduledController,
-    env: Env,
-    ctx: ExecutionContext
-  ): Promise<void> {
+  async fetch(request: Request): Promise<Response> {
+    // Access D1 via Resource (no env parameter needed)
+    const result = await Resource.SpotifyCache.prepare(
+      "SELECT * FROM spotify_audio_features_cache WHERE spotify_id = ?"
+    ).bind("abc123").first();
+
+    // Access KV
+    const cached = await Resource.SpotifyKV.get("spotify:af:abc123");
+
+    // Access R2
+    const dbFile = await Resource.SpotifyStorage.get("spotify_tracks.db");
+
+    return new Response(JSON.stringify(result));
+  },
+};
+```
+
+**Cron worker for promotion:**
+
+```typescript
+// workers/spotify-promotion/src/index.ts
+import { Resource } from "sst";
+
+export default {
+  async scheduled(controller: ScheduledController): Promise<void> {
     const config: PromotionConfig = {
       accessThreshold: 3,
       batchSize: 1000,
       maxVectors: 20_000_000,
-      checkIntervalHours: 24
+      checkIntervalHours: 24,
     };
 
-    const cache = new SpotifyMetadataCache({
-      kv: env.KV,
-      d1: env.DB,
-      r2: env.R2,
-      vectorize: env.VECTORIZE
-    });
+    // SST's Resource SDK provides typed access to linked resources
+    const candidates = await Resource.SpotifyCache.prepare(`
+      SELECT tal.spotify_id, tal.access_count, saf.*
+      FROM track_access_log tal
+      JOIN spotify_audio_features_cache saf ON saf.spotify_id = tal.spotify_id
+      WHERE tal.access_count >= ? AND tal.vectorized = 0
+      ORDER BY tal.access_count DESC
+      LIMIT ?
+    `).bind(config.accessThreshold, config.batchSize).all();
 
-    const promoted = await promoteTracksToVectorize(config, cache);
-    console.log(`Cron: Promoted ${promoted} tracks to Vectorize`);
+    if (candidates.results.length === 0) return;
+
+    // Vectorize promotion logic here...
+    console.log(`Cron: Found ${candidates.results.length} tracks to promote`);
   },
-
-  async fetch(request: Request, env: Env): Promise<Response> {
-    // Normal request handling...
-  }
 };
 ```
+
+**Deploy with SST:**
+
+```bash
+# Development (local)
+pnpm sst dev
+
+# Deploy to production
+pnpm sst deploy --stage production
+```
+
+#### SST vs wrangler.toml Comparison
+
+| Aspect | wrangler.toml | SST |
+|--------|---------------|-----|
+| Config format | TOML | TypeScript |
+| Type safety | None | Full |
+| Resource access | `env.BINDING` | `Resource.Name` |
+| Multi-resource linking | Manual IDs | Automatic |
+| Cron triggers | `[triggers]` section | `sst.cloudflare.Cron` component |
+| Local dev | `wrangler dev` | `sst dev` (with live reload) |
+| Package manager | Any | pnpm recommended |
 
 ### Precomputed Similarity Cache
 
